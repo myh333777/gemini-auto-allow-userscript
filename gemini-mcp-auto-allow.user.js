@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.0.2
+// @version      2.1.0
 // @description  Automatically clicks "始终允许" (Always allow) — or fallback Allow — on Gemini confirmation cards across Chat & Task modes.
 // @author       myh333777
 // @match        https://gemini.google.com/*
@@ -17,8 +17,13 @@
 (function () {
   'use strict';
 
+  const SCRIPT_VERSION = '2.1.0';
+
   // ==================== 配置项 ====================
-  const CLICK_DELAY_MS = 150;
+  const CLICK_DELAY_MS = 200;
+  const RETRY_COOLDOWN_MS = 1500;
+  const MAX_RETRIES = 5;
+  const FALLBACK_POLL_MS = 2000;
   // 若卡片没有“始终允许”，是否回退点击“在此对话中允许”或“允许 / 允许一次”
   const FALLBACK_TO_CHAT_OR_ONCE = true;
   // ==============================================
@@ -44,8 +49,17 @@
     /^(allow once|allow)$/i,
   ];
 
-  const scheduledButtons = new WeakSet();
+  // 记录每个按钮的调度状态：{ pending: boolean, attempts: number, lastAttemptAt: number }
+  const buttonState = new WeakMap();
   let scanScheduled = false;
+  let clickCount = 0;
+
+  function markInjected() {
+    if (document.documentElement) {
+      document.documentElement.dataset.geminiAutoAllow = SCRIPT_VERSION;
+      document.documentElement.dataset.geminiAutoAllowClicks = String(clickCount);
+    }
+  }
 
   function normalizeText(element) {
     return (element?.textContent || '').replace(/\s+/g, ' ').trim();
@@ -122,28 +136,61 @@
     return null;
   }
 
+  function triggerClick(button) {
+    // 补充鼠标按下/抬起与原生 click，兼容 Angular Material / JSAction 事件委派
+    try {
+      button.dispatchEvent(
+        new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window })
+      );
+      button.dispatchEvent(
+        new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window })
+      );
+    } catch (_) {
+      // 忽略构造事件异常，继续执行原生 click()
+    }
+    button.click();
+  }
+
   function handleCard(card) {
     const targetButton = findTargetButton(card);
-    if (!targetButton || scheduledButtons.has(targetButton)) {
+    if (!targetButton) {
       return;
     }
 
-    scheduledButtons.add(targetButton);
-    const label = normalizeText(targetButton);
-
-    const doClick = () => {
-      if (isButtonEnabled(targetButton) && findTargetButton(card) === targetButton) {
-        targetButton.click();
-        console.info(`[Gemini Auto Allow] 已自动点击「${label}」`);
-      }
+    const now = Date.now();
+    const state = buttonState.get(targetButton) || {
+      pending: false,
+      attempts: 0,
+      lastAttemptAt: 0,
     };
 
-    // 后台标签页直接点击，绕过浏览器对后台定时器（1s/60s）的节流；前台保留短暂延迟
-    if (document.hidden || CLICK_DELAY_MS <= 0) {
-      doClick();
-    } else {
-      window.setTimeout(doClick, CLICK_DELAY_MS);
+    if (
+      state.pending ||
+      state.attempts >= MAX_RETRIES ||
+      (state.lastAttemptAt > 0 && now - state.lastAttemptAt < RETRY_COOLDOWN_MS)
+    ) {
+      return;
     }
+
+    state.pending = true;
+    buttonState.set(targetButton, state);
+    const label = normalizeText(targetButton);
+
+    window.setTimeout(() => {
+      state.pending = false;
+      if (isButtonEnabled(targetButton) && findTargetButton(card) === targetButton) {
+        state.attempts += 1;
+        state.lastAttemptAt = Date.now();
+        buttonState.set(targetButton, state);
+
+        triggerClick(targetButton);
+        clickCount += 1;
+        markInjected();
+        console.info(
+          `[Gemini Auto Allow] 已自动点击「${label}」（第 ${state.attempts} 次尝试）`
+        );
+      }
+    }, CLICK_DELAY_MS);
   }
 
   function scan() {
@@ -156,9 +203,11 @@
       return;
     }
     scanScheduled = true;
-    // 微任务不受后台标签页定时器节流影响，同时合并同一次 DOM 批量更新
-    queueMicrotask(scan);
+    window.setTimeout(scan, 50);
   }
+
+  markInjected();
+  console.info(`[Gemini Auto Allow] v${SCRIPT_VERSION} 已启动`);
 
   const observer = new MutationObserver(scheduleScan);
   observer.observe(document.documentElement, {
@@ -169,5 +218,7 @@
     attributeFilter: ['disabled', 'aria-disabled', 'inert', 'class', 'style'],
   });
 
-  scheduleScan();
+  // 定期兜底巡检，覆盖重试冷却结束或后台节流唤醒后的待审批卡片
+  window.setInterval(scan, FALLBACK_POLL_MS);
+  scan();
 })();
