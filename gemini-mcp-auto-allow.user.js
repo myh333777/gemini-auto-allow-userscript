@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.0.0
+// @version      2.0.1
 // @description  Automatically clicks "始终允许" (Always allow) — or fallback Allow — on Gemini confirmation cards across Chat & Task modes.
 // @author       myh333777
 // @match        https://gemini.google.com/*
@@ -150,7 +150,8 @@
       return;
     }
     scanScheduled = true;
-    window.requestAnimationFrame(scan);
+    // 使用 setTimeout 而非 requestAnimationFrame，确保 Gemini 在后台标签页运行任务时也能自动审批
+    window.setTimeout(scan, 50);
   }
 
   const observer = new MutationObserver(scheduleScan);
