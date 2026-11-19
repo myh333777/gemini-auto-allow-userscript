@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.0.1
+// @version      2.0.2
 // @description  Automatically clicks "始终允许" (Always allow) — or fallback Allow — on Gemini confirmation cards across Chat & Task modes.
 // @author       myh333777
 // @match        https://gemini.google.com/*
@@ -131,13 +131,19 @@
     scheduledButtons.add(targetButton);
     const label = normalizeText(targetButton);
 
-    window.setTimeout(() => {
-      // 延迟后再次确认按钮仍然有效且处于同一确认卡片
+    const doClick = () => {
       if (isButtonEnabled(targetButton) && findTargetButton(card) === targetButton) {
         targetButton.click();
         console.info(`[Gemini Auto Allow] 已自动点击「${label}」`);
       }
-    }, CLICK_DELAY_MS);
+    };
+
+    // 后台标签页直接点击，绕过浏览器对后台定时器（1s/60s）的节流；前台保留短暂延迟
+    if (document.hidden || CLICK_DELAY_MS <= 0) {
+      doClick();
+    } else {
+      window.setTimeout(doClick, CLICK_DELAY_MS);
+    }
   }
 
   function scan() {
@@ -150,8 +156,8 @@
       return;
     }
     scanScheduled = true;
-    // 使用 setTimeout 而非 requestAnimationFrame，确保 Gemini 在后台标签页运行任务时也能自动审批
-    window.setTimeout(scan, 50);
+    // 微任务不受后台标签页定时器节流影响，同时合并同一次 DOM 批量更新
+    queueMicrotask(scan);
   }
 
   const observer = new MutationObserver(scheduleScan);
