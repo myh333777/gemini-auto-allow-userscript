@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.1.0
+// @version      2.2.0
 // @description  Automatically clicks "始终允许" (Always allow) — or fallback Allow — on Gemini confirmation cards across Chat & Task modes.
 // @author       myh333777
 // @match        https://gemini.google.com/*
@@ -17,10 +17,10 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '2.1.0';
+  const SCRIPT_VERSION = '2.2.0';
 
   // ==================== 配置项 ====================
-  const CLICK_DELAY_MS = 200;
+  const CLICK_DELAY_MS = 200; // 仅前台使用；后台标签页立即点击（后台 setTimeout 会被节流）
   const RETRY_COOLDOWN_MS = 1500;
   const MAX_RETRIES = 5;
   const FALLBACK_POLL_MS = 2000;
@@ -176,7 +176,7 @@
     buttonState.set(targetButton, state);
     const label = normalizeText(targetButton);
 
-    window.setTimeout(() => {
+    const doClick = () => {
       state.pending = false;
       if (isButtonEnabled(targetButton) && findTargetButton(card) === targetButton) {
         state.attempts += 1;
@@ -187,10 +187,17 @@
         clickCount += 1;
         markInjected();
         console.info(
-          `[Gemini Auto Allow] 已自动点击「${label}」（第 ${state.attempts} 次尝试）`
+          `[Gemini Auto Allow] 已自动点击「${label}」（第 ${state.attempts} 次尝试，${document.hidden ? '后台' : '前台'}）`
         );
       }
-    }, CLICK_DELAY_MS);
+    };
+
+    // 后台标签页：MutationObserver 回调不受节流，直接同步点击；前台保留短延迟等 Angular 绑定完成
+    if (document.hidden) {
+      doClick();
+    } else {
+      window.setTimeout(doClick, CLICK_DELAY_MS);
+    }
   }
 
   function scan() {
@@ -203,7 +210,8 @@
       return;
     }
     scanScheduled = true;
-    window.setTimeout(scan, 50);
+    // 微任务：后台标签页也即时执行，并合并同一批 DOM 变更
+    queueMicrotask(scan);
   }
 
   markInjected();
@@ -220,5 +228,9 @@
 
   // 定期兜底巡检，覆盖重试冷却结束或后台节流唤醒后的待审批卡片
   window.setInterval(scan, FALLBACK_POLL_MS);
+  // 切回标签页 / 窗口获得焦点 / bfcache 恢复时立即补扫
+  document.addEventListener('visibilitychange', scan);
+  window.addEventListener('focus', scan);
+  window.addEventListener('pageshow', scan);
   scan();
 })();

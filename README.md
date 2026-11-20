@@ -5,11 +5,11 @@
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v2.1.0-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v2.1.0"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v2.2.0-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v2.2.0"></a>
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v2.1.0-3776AB?style=flat-square" alt="Version v2.1.0"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v2.2.0-3776AB?style=flat-square" alt="Version v2.2.0"></a>
   <img src="https://img.shields.io/badge/Target-gemini.google.com-4B5563?style=flat-square" alt="Target gemini.google.com">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E?style=flat-square" alt="License: MIT"></a>
 </p>
@@ -31,7 +31,7 @@
 1. 先在浏览器安装用户脚本管理器：[Tampermonkey](https://www.tampermonkey.net/)、[Violentmonkey](https://violentmonkey.github.io/) 或 [ScriptCat](https://docs.scriptcat.org/)。
 2. 点击下方安装按钮，扩展会自动弹出脚本安装确认页（后续将通过 `@updateURL` 自动检查更新）：
 
-[![点击一键安装 v2.1.0](https://img.shields.io/badge/%E7%82%B9%E5%87%BB%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85-gemini--mcp--auto--allow.user.js-2B5B84?style=for-the-badge)](https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js)
+[![点击一键安装 v2.2.0](https://img.shields.io/badge/%E7%82%B9%E5%87%BB%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85-gemini--mcp--auto--allow.user.js-2B5B84?style=for-the-badge)](https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js)
 
 3. 手动安装备选：打开 [`gemini-mcp-auto-allow.user.js`](./gemini-mcp-auto-allow.user.js) 点击 **Raw**，或复制代码到脚本管理器中新建保存。
 
