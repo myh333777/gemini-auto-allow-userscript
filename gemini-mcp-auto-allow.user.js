@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Gemini MCP & Task Auto Always Allow
+// @name         Gemini MCP & Task Auto Always Allow (+ Auto Continue)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.2.0
-// @description  Automatically clicks "始终允许" (Always allow) — or fallback Allow — on Gemini confirmation cards across Chat & Task modes.
+// @version      2.3.0
+// @description  Automatically clicks "始终允许" (Always allow) on Gemini confirmation cards, and optionally auto-replies "继续" when Gemini asks to proceed.
 // @author       myh333777
 // @match        https://gemini.google.com/*
 // @homepageURL  https://github.com/myh333777/gemini-auto-allow-userscript
@@ -17,15 +17,22 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '2.2.0';
+  const SCRIPT_VERSION = '2.3.0';
 
   // ==================== 配置项 ====================
-  const CLICK_DELAY_MS = 200; // 仅前台使用；后台标签页立即点击（后台 setTimeout 会被节流）
+  const CLICK_DELAY_MS = 200; // 仅前台使用；后台标签页立即点击
   const RETRY_COOLDOWN_MS = 1500;
   const MAX_RETRIES = 5;
   const FALLBACK_POLL_MS = 2000;
   // 若卡片没有“始终允许”，是否回退点击“在此对话中允许”或“允许 / 允许一次”
   const FALLBACK_TO_CHAT_OR_ONCE = true;
+
+  // -------- 自动回复“继续”配置 --------
+  const AUTO_CONTINUE_DEFAULT = true; // 初始是否开启自动“继续”（可在右下角小胶囊一键切换）
+  const CONTINUE_TEXT = '继续';
+  const CONTINUE_STABLE_MS = 1800; // 模型停止输出后，等待文本稳定多久再发送
+  const MAX_CONSECUTIVE_CONTINUES = 10; // 单次会话连续自动“继续”上限，防止无限循环耗尽额度
+  const SHOW_STATUS_BADGE = true; // 是否在右下角显示极简状态胶囊
   // ==============================================
 
   const CARD_SELECTOR = 'remy-confirmation-card, remy-confirmation-card-v2';
@@ -49,16 +56,110 @@
     /^(allow once|allow)$/i,
   ];
 
-  // 记录每个按钮的调度状态：{ pending: boolean, attempts: number, lastAttemptAt: number }
+  // 识别“请求回复继续 / 确认进入下一步”的模糊匹配规则（按单句判定，同句共现即命中）
+  const CONTINUE_SENTENCE_RULES = [
+    // 同句共现：回复/输入/发送/确认/告知 + 继续/下一步/proceed/continue
+    {
+      a: /(?:回复|输入|发送|告诉|说一声|回个|确认|同意|告知|reply|type|say|send|confirm)/i,
+      b: /(?:继续|下一步|往下|接着|proceed|continue)/i,
+    },
+    // 同句共现：询问是否继续
+    {
+      a: /(?:是否|要我|需要我|要不要|能否|可以|准备好|没问题|shall\s+i|should\s+i|would\s+you\s+like|want\s+me\s+to)/i,
+      b: /(?:继续|下一步|往下|接着|proceed|continue)/i,
+    },
+    // 兜底短句：直接以“继续吗？”、“下一步？”、“continue?”结尾
+    {
+      a: /(?:继续|下一步|proceed|continue)\s*[吗？?]\s*$/i,
+      b: /(?:继续|下一步|proceed|continue)/i,
+    },
+  ];
+
+  // 否定/无法继续的句子不触发
+  const CONTINUE_NEGATIVE_PATTERN = /(?:无法|不能|不再|暂停|停止|不要|不必|无需|别|勿|don['’]t|cannot|can['’]t|unable\s+to)\s*(?:继续|proceed|continue)/i;
+
+  // 遇到高风险操作、报错卡死或明确需要人工选择时，不自动回复“继续”
+  const CONTINUE_BLOCK_PATTERNS = [
+    /(?:删除|清空|覆盖生产|不可逆|风险较高|请提供|请输入|密码|token|cookie|验证码|登录|手动处理|报错|失败原因)/i,
+    /(?:请选择|选哪一个|方案\s*[A1]|选项\s*[A1])/i,
+  ];
+
   const buttonState = new WeakMap();
   let scanScheduled = false;
   let clickCount = 0;
+  let autoContinueEnabled = AUTO_CONTINUE_DEFAULT;
+  let consecutiveContinues = 0;
+  let lastHandledResponseKey = '';
+  let pendingContinueTimer = null;
+  let pendingContinueCandidateKey = '';
+  let badgeEl = null;
 
   function markInjected() {
     if (document.documentElement) {
       document.documentElement.dataset.geminiAutoAllow = SCRIPT_VERSION;
       document.documentElement.dataset.geminiAutoAllowClicks = String(clickCount);
+      document.documentElement.dataset.geminiAutoContinue = String(autoContinueEnabled);
     }
+    updateBadge();
+  }
+
+  function ensureBadge() {
+    if (!SHOW_STATUS_BADGE || badgeEl || !document.body) {
+      return;
+    }
+    badgeEl = document.createElement('button');
+    badgeEl.type = 'button';
+    badgeEl.id = 'gemini-auto-allow-badge';
+    badgeEl.title = '点击切换：自动回复“继续”开关';
+    Object.assign(badgeEl.style, {
+      position: 'fixed',
+      right: '14px',
+      bottom: '12px',
+      zIndex: '99999',
+      padding: '4px 10px',
+      borderRadius: '999px',
+      border: '1px solid rgba(128,128,128,0.28)',
+      background: 'rgba(28, 28, 32, 0.78)',
+      color: '#e8eaed',
+      fontSize: '11px',
+      lineHeight: '16px',
+      fontFamily: 'system-ui, -apple-system, sans-serif',
+      cursor: 'pointer',
+      backdropFilter: 'blur(6px)',
+      opacity: '0.72',
+      transition: 'opacity 0.15s ease',
+    });
+    badgeEl.addEventListener('mouseenter', () => {
+      badgeEl.style.opacity = '1';
+    });
+    badgeEl.addEventListener('mouseleave', () => {
+      badgeEl.style.opacity = '0.72';
+    });
+    badgeEl.addEventListener('click', () => {
+      autoContinueEnabled = !autoContinueEnabled;
+      if (autoContinueEnabled) {
+        consecutiveContinues = 0;
+      } else if (pendingContinueTimer) {
+        clearTimeout(pendingContinueTimer);
+        pendingContinueTimer = null;
+      }
+      markInjected();
+    });
+    document.body.appendChild(badgeEl);
+  }
+
+  function updateBadge() {
+    if (!SHOW_STATUS_BADGE) {
+      return;
+    }
+    ensureBadge();
+    if (!badgeEl) {
+      return;
+    }
+    const contText = autoContinueEnabled
+      ? `自动继续:开(${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES})`
+      : '自动继续:关';
+    badgeEl.textContent = `自动允许:${clickCount} | ${contText}`;
   }
 
   function normalizeText(element) {
@@ -92,8 +193,14 @@
     ) {
       return false;
     }
-    const rect = button.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    // 后台标签页或未完成 layout 时不做死卡，前台才校验包围盒尺寸
+    if (!document.hidden) {
+      const rect = button.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) {
+        return false;
+      }
+    }
+    return true;
   }
 
   function findTargetButton(card) {
@@ -102,7 +209,6 @@
       return null;
     }
 
-    // 1. 先确认卡片内存在“不允许 / 拒绝”按钮（确保是权限确认卡片）
     const hasDenyButton = buttons.some((btn) =>
       matchesAny(normalizeText(btn), DENY_PATTERNS)
     );
@@ -110,7 +216,6 @@
       return null;
     }
 
-    // 2. 优先匹配“始终允许 / Always allow”
     const enabledButtons = buttons.filter(isButtonEnabled);
     for (const pattern of ALWAYS_ALLOW_PATTERNS) {
       const match = enabledButtons.find((btn) =>
@@ -121,7 +226,6 @@
       }
     }
 
-    // 3. 按需回退匹配“在此对话中允许 / 允许一次 / 允许”
     if (FALLBACK_TO_CHAT_OR_ONCE) {
       for (const pattern of FALLBACK_ALLOW_PATTERNS) {
         const match = enabledButtons.find((btn) =>
@@ -137,14 +241,14 @@
   }
 
   function triggerClick(button) {
-    // 补充鼠标按下/抬起与原生 click，兼容 Angular Material / JSAction 事件委派
+    const eventInit = { bubbles: true, cancelable: true, view: window };
     try {
-      button.dispatchEvent(
-        new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window })
-      );
-      button.dispatchEvent(
-        new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window })
-      );
+      if (typeof PointerEvent === 'function') {
+        button.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+        button.dispatchEvent(new PointerEvent('pointerup', eventInit));
+      }
+      button.dispatchEvent(new MouseEvent('mousedown', eventInit));
+      button.dispatchEvent(new MouseEvent('mouseup', eventInit));
     } catch (_) {
       // 忽略构造事件异常，继续执行原生 click()
     }
@@ -192,7 +296,6 @@
       }
     };
 
-    // 后台标签页：MutationObserver 回调不受节流，直接同步点击；前台保留短延迟等 Angular 绑定完成
     if (document.hidden) {
       doClick();
     } else {
@@ -200,9 +303,172 @@
     }
   }
 
+  // ==================== 自动回复“继续”模块 ====================
+  function isGenerating() {
+    return Boolean(
+      document.querySelector(
+        'button[aria-label*="Stop"], button[aria-label*="停止"], .stop-icon'
+      )
+    );
+  }
+
+  function hasPendingConfirmationCard() {
+    const cards = document.querySelectorAll(CARD_SELECTOR);
+    for (const card of cards) {
+      if (findTargetButton(card)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function getLastModelResponseInfo() {
+    const responses = [...document.querySelectorAll('model-response')];
+    if (responses.length === 0) {
+      return null;
+    }
+    const last = responses[responses.length - 1];
+    // 如果最后一条还包含未完成的权限卡片，先不发“继续”
+    if (last.querySelector(CARD_SELECTOR) && hasPendingConfirmationCard()) {
+      return null;
+    }
+    const contentEl = last.querySelector('message-content') || last;
+    const fullText = normalizeText(contentEl);
+    if (!fullText) {
+      return null;
+    }
+    const tail = fullText.slice(-260);
+    const key = `${responses.length}:${fullText.length}:${tail.slice(-80)}`;
+    return { key, tail };
+  }
+
+  function sendContinueReply() {
+    const editor = document.querySelector(
+      'rich-textarea .ql-editor, [contenteditable="true"][role="textbox"]'
+    );
+    if (!editor) {
+      return false;
+    }
+    // 如果用户正在输入框里打字，绝不覆盖用户输入
+    if (normalizeText(editor).length > 0) {
+      return false;
+    }
+
+    editor.focus();
+    editor.textContent = CONTINUE_TEXT;
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+
+    const tryClickSend = () => {
+      const sendBtn = document.querySelector(
+        'button.send-button, button[aria-label*="Send"], button[aria-label*="发送"]'
+      );
+      if (sendBtn && isButtonEnabled(sendBtn)) {
+        triggerClick(sendBtn);
+        return true;
+      }
+      // 兜底：派发 Enter 键提交
+      editor.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+      return true;
+    };
+
+    window.setTimeout(tryClickSend, 120);
+    return true;
+  }
+
+  function matchesContinueTail(tail) {
+    if (matchesAny(tail, CONTINUE_BLOCK_PATTERNS)) {
+      return false;
+    }
+    // 按句子拆分，仅检查末尾最多 3 句；单句内同句共现即命中
+    const sentences = tail
+      .split(/[\n。！？!?；;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(-3);
+
+    return sentences.some((sentence) => {
+      if (CONTINUE_NEGATIVE_PATTERN.test(sentence)) {
+        return false;
+      }
+      return CONTINUE_SENTENCE_RULES.some(
+        (rule) => rule.a.test(sentence) && rule.b.test(sentence)
+      );
+    });
+  }
+
+  function checkAutoContinue() {
+    if (!autoContinueEnabled) {
+      return;
+    }
+    if (consecutiveContinues >= MAX_CONSECUTIVE_CONTINUES) {
+      return;
+    }
+    if (isGenerating() || hasPendingConfirmationCard()) {
+      if (pendingContinueTimer) {
+        clearTimeout(pendingContinueTimer);
+        pendingContinueTimer = null;
+      }
+      return;
+    }
+
+    const info = getLastModelResponseInfo();
+    if (!info || info.key === lastHandledResponseKey) {
+      return;
+    }
+
+    if (!matchesContinueTail(info.tail)) {
+      return;
+    }
+
+    if (pendingContinueCandidateKey === info.key && pendingContinueTimer) {
+      return;
+    }
+
+    if (pendingContinueTimer) {
+      clearTimeout(pendingContinueTimer);
+    }
+    pendingContinueCandidateKey = info.key;
+
+    const executeContinue = () => {
+      pendingContinueTimer = null;
+      if (!autoContinueEnabled || isGenerating() || hasPendingConfirmationCard()) {
+        return;
+      }
+      const latest = getLastModelResponseInfo();
+      if (!latest || latest.key !== info.key || latest.key === lastHandledResponseKey) {
+        return;
+      }
+      if (sendContinueReply()) {
+        lastHandledResponseKey = latest.key;
+        consecutiveContinues += 1;
+        markInjected();
+        console.info(
+          `[Gemini Auto Allow] 检测到继续提示，已自动回复「${CONTINUE_TEXT}」（${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES}）`
+        );
+      }
+    };
+
+    if (document.hidden) {
+      executeContinue();
+    } else {
+      pendingContinueTimer = window.setTimeout(executeContinue, CONTINUE_STABLE_MS);
+    }
+  }
+  // ==============================================================
+
   function scan() {
     scanScheduled = false;
     document.querySelectorAll(CARD_SELECTOR).forEach(handleCard);
+    checkAutoContinue();
   }
 
   function scheduleScan() {
@@ -210,8 +476,26 @@
       return;
     }
     scanScheduled = true;
-    // 微任务：后台标签页也即时执行，并合并同一批 DOM 变更
     queueMicrotask(scan);
+  }
+
+  // 使用轻量内联 Web Worker 减轻后台普通节流（若浏览器彻底冻结标签页，则依赖 resume 事件恢复）
+  function startBackgroundHeartbeat() {
+    let fallbackTimer = null;
+    const startFallback = () => {
+      if (!fallbackTimer) {
+        fallbackTimer = window.setInterval(scan, FALLBACK_POLL_MS);
+      }
+    };
+    try {
+      const workerCode = `setInterval(() => postMessage('tick'), ${FALLBACK_POLL_MS});`;
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      const worker = new Worker(URL.createObjectURL(blob));
+      worker.onmessage = scan;
+      worker.onerror = startFallback;
+    } catch (_) {
+      startFallback();
+    }
   }
 
   markInjected();
@@ -226,10 +510,9 @@
     attributeFilter: ['disabled', 'aria-disabled', 'inert', 'class', 'style'],
   });
 
-  // 定期兜底巡检，覆盖重试冷却结束或后台节流唤醒后的待审批卡片
-  window.setInterval(scan, FALLBACK_POLL_MS);
-  // 切回标签页 / 窗口获得焦点 / bfcache 恢复时立即补扫
+  startBackgroundHeartbeat();
   document.addEventListener('visibilitychange', scan);
+  document.addEventListener('resume', scan);
   window.addEventListener('focus', scan);
   window.addEventListener('pageshow', scan);
   scan();
