@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Auto Continue)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.3.0
+// @version      2.3.1
 // @description  Automatically clicks "始终允许" (Always allow) on Gemini confirmation cards, and optionally auto-replies "继续" when Gemini asks to proceed.
 // @author       myh333777
 // @match        https://gemini.google.com/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '2.3.0';
+  const SCRIPT_VERSION = '2.3.1';
 
   // ==================== 配置项 ====================
   const CLICK_DELAY_MS = 200; // 仅前台使用；后台标签页立即点击
@@ -80,7 +80,8 @@
 
   // 遇到高风险操作、报错卡死或明确需要人工选择时，不自动回复“继续”
   const CONTINUE_BLOCK_PATTERNS = [
-    /(?:删除|清空|覆盖生产|不可逆|风险较高|请提供|请输入|密码|token|cookie|验证码|登录|手动处理|报错|失败原因)/i,
+    /(?:删除|清空|覆盖生产|不可逆|风险较高|手动处理|报错|失败原因)/i,
+    /(?:请先提供|必须提供|缺少|请输入).{0,12}(?:密码|token|cookie|验证码|登录)/i,
     /(?:请选择|选哪一个|方案\s*[A1]|选项\s*[A1])/i,
   ];
 
@@ -337,7 +338,7 @@
     if (!fullText) {
       return null;
     }
-    const tail = fullText.slice(-260);
+    const tail = fullText.slice(-1200);
     const key = `${responses.length}:${fullText.length}:${tail.slice(-80)}`;
     return { key, tail };
   }
@@ -388,12 +389,11 @@
     if (matchesAny(tail, CONTINUE_BLOCK_PATTERNS)) {
       return false;
     }
-    // 按句子拆分，仅检查末尾最多 3 句；单句内同句共现即命中
+    // 按句子拆分，检查末尾 1200 字内的句子（覆盖“小标题写回复继续 + 下方列清单”的格式）
     const sentences = tail
       .split(/[\n。！？!?；;]+/)
       .map((s) => s.trim())
-      .filter(Boolean)
-      .slice(-3);
+      .filter(Boolean);
 
     return sentences.some((sentence) => {
       if (CONTINUE_NEGATIVE_PATTERN.test(sentence)) {
