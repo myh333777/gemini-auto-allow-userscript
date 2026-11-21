@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Auto Continue)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.3.1
+// @version      2.3.2
 // @description  Automatically clicks "始终允许" (Always allow) on Gemini confirmation cards, and optionally auto-replies "继续" when Gemini asks to proceed.
 // @author       myh333777
 // @match        https://gemini.google.com/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '2.3.1';
+  const SCRIPT_VERSION = '2.3.2';
 
   // ==================== 配置项 ====================
   const CLICK_DELAY_MS = 200; // 仅前台使用；后台标签页立即点击
@@ -77,13 +77,6 @@
 
   // 否定/无法继续的句子不触发
   const CONTINUE_NEGATIVE_PATTERN = /(?:无法|不能|不再|暂停|停止|不要|不必|无需|别|勿|don['’]t|cannot|can['’]t|unable\s+to)\s*(?:继续|proceed|continue)/i;
-
-  // 遇到高风险操作、报错卡死或明确需要人工选择时，不自动回复“继续”
-  const CONTINUE_BLOCK_PATTERNS = [
-    /(?:删除|清空|覆盖生产|不可逆|风险较高|手动处理|报错|失败原因)/i,
-    /(?:请先提供|必须提供|缺少|请输入).{0,12}(?:密码|token|cookie|验证码|登录)/i,
-    /(?:请选择|选哪一个|方案\s*[A1]|选项\s*[A1])/i,
-  ];
 
   const buttonState = new WeakMap();
   let scanScheduled = false;
@@ -386,9 +379,6 @@
   }
 
   function matchesContinueTail(tail) {
-    if (matchesAny(tail, CONTINUE_BLOCK_PATTERNS)) {
-      return false;
-    }
     // 按句子拆分，检查末尾 1200 字内的句子（覆盖“小标题写回复继续 + 下方列清单”的格式）
     const sentences = tail
       .split(/[\n。！？!?；;]+/)
