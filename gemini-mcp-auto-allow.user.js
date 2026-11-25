@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Auto Continue)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.3.3
+// @version      2.3.4
 // @description  Automatically clicks "始终允许" (Always allow) on Gemini confirmation cards, and optionally auto-replies "继续" when Gemini asks to proceed.
 // @author       myh333777
 // @match        https://gemini.google.com/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '2.3.3';
+  const SCRIPT_VERSION = '2.3.4';
 
   // ==================== 配置项 ====================
   const CLICK_DELAY_MS = 200; // 仅前台使用；后台标签页立即点击
@@ -79,6 +79,8 @@
   const CONTINUE_NEGATIVE_PATTERN = /(?:无法|不能|不再|暂停|停止|不要|不必|无需|别|勿|don['’]t|cannot|can['’]t|unable\s+to)\s*(?:继续|proceed|continue)/i;
 
   const buttonState = new WeakMap();
+  const stuckSendState = new WeakMap();
+  const STUCK_APPROVAL_SEND_DELAY_MS = 600;
   let scanScheduled = false;
   let clickCount = 0;
   let autoContinueEnabled = AUTO_CONTINUE_DEFAULT;
@@ -455,9 +457,99 @@
   }
   // ==============================================================
 
+  // ==================== 滞留审批文本自动补发 ====================
+  // Gemini 部分新版 MCP 卡片在点击“始终允许/允许”后，会把文案填入输入框但偶发不自动提交
+  function flushStuckApprovalInput() {
+    if (isGenerating() || hasPendingConfirmationCard()) {
+      return;
+    }
+
+    const responses = [...document.querySelectorAll('model-response')];
+    if (responses.length === 0) {
+      return;
+    }
+    const lastResp = responses[responses.length - 1];
+    const card = lastResp.querySelector(CARD_SELECTOR);
+    if (!card) {
+      return;
+    }
+
+    const editor = document.querySelector(
+      'rich-textarea .ql-editor, [contenteditable="true"][role="textbox"]'
+    );
+    if (!editor) {
+      return;
+    }
+    const editorText = normalizeText(editor);
+    if (
+      !editorText ||
+      (!matchesAny(editorText, ALWAYS_ALLOW_PATTERNS) &&
+        !matchesAny(editorText, FALLBACK_ALLOW_PATTERNS))
+    ) {
+      return;
+    }
+
+    const sendBtn = document.querySelector(
+      'button.send-button, button[aria-label*="Send"], button[aria-label*="发送"]'
+    );
+    if (!sendBtn || !isButtonEnabled(sendBtn)) {
+      return;
+    }
+
+    const now = Date.now();
+    const state = stuckSendState.get(card) || {
+      pending: false,
+      attempts: 0,
+      lastAttemptAt: 0,
+    };
+    if (
+      state.pending ||
+      state.attempts >= MAX_RETRIES ||
+      (state.lastAttemptAt > 0 && now - state.lastAttemptAt < RETRY_COOLDOWN_MS)
+    ) {
+      return;
+    }
+
+    state.pending = true;
+    stuckSendState.set(card, state);
+
+    const doSend = () => {
+      state.pending = false;
+      if (isGenerating() || hasPendingConfirmationCard()) {
+        return;
+      }
+      const currentText = normalizeText(editor);
+      if (currentText !== editorText) {
+        return;
+      }
+      const currentSendBtn = document.querySelector(
+        'button.send-button, button[aria-label*="Send"], button[aria-label*="发送"]'
+      );
+      if (!currentSendBtn || !isButtonEnabled(currentSendBtn)) {
+        return;
+      }
+      state.attempts += 1;
+      state.lastAttemptAt = Date.now();
+      stuckSendState.set(card, state);
+
+      triggerClick(currentSendBtn);
+      console.info(
+        `[Gemini Auto Allow] 检测到滞留输入框的审批文本「${editorText}」，已自动点击发送（第 ${state.attempts} 次尝试）`
+      );
+    };
+
+    if (document.hidden) {
+      doSend();
+    } else {
+      window.setTimeout(doSend, STUCK_APPROVAL_SEND_DELAY_MS);
+    }
+  }
+  // ==============================================================
+
   function scan() {
     scanScheduled = false;
     document.querySelectorAll(CARD_SELECTOR).forEach(handleCard);
+    flushStuckApprovalInput();
     checkAutoContinue();
   }
 
