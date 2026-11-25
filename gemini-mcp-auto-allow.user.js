@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Auto Continue)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.3.2
+// @version      2.3.3
 // @description  Automatically clicks "始终允许" (Always allow) on Gemini confirmation cards, and optionally auto-replies "继续" when Gemini asks to proceed.
 // @author       myh333777
 // @match        https://gemini.google.com/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '2.3.2';
+  const SCRIPT_VERSION = '2.3.3';
 
   // ==================== 配置项 ====================
   const CLICK_DELAY_MS = 200; // 仅前台使用；后台标签页立即点击
@@ -37,10 +37,10 @@
 
   const CARD_SELECTOR = 'remy-confirmation-card, remy-confirmation-card-v2';
 
-  // 确认这是一张工具/权限审批卡片（必须同时存在拒绝类按钮，避免误点普通横幅）
+  // 确认这是一张工具/权限审批卡片（必须同时存在拒绝/取消类按钮，避免误点普通横幅）
   const DENY_PATTERNS = [
-    /^(不允许|拒绝)$/i,
-    /^(deny|don['’]t allow|disallow|decline)$/i,
+    /^(不允许|拒绝|取消|不同意)$/i,
+    /^(deny|don['’]t allow|disallow|decline|cancel|reject)$/i,
   ];
 
   // 按钮点击优先级：始终允许 > 本次对话允许 > 允许/允许一次
@@ -52,8 +52,8 @@
   const FALLBACK_ALLOW_PATTERNS = [
     /^(在此对话中允许|本对话允许)$/i,
     /^allow for this chat$/i,
-    /^(允许一次|允许)$/i,
-    /^(allow once|allow)$/i,
+    /^(允许一次|允许|同意)$/i,
+    /^(allow once|allow|approve)$/i,
   ];
 
   // 识别“请求回复继续 / 确认进入下一步”的模糊匹配规则（按单句判定，同句共现即命中）
