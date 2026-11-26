@@ -1,68 +1,55 @@
-<h1 align="center">Gemini MCP &amp; Task Auto Always Allow</h1>
+<h1 align="center">Gemini MCP &amp; Task Auto Always Allow (+ Prompt Queue)</h1>
 
 <p align="center">
-  面向 Google Gemini 网页端（聊天模式与任务模式）的自动权限审批油猴脚本，优先自动点击「始终允许」，并在无该选项时按需回退点击「允许 / 允许一次」。
+  面向 Google Gemini 网页端（聊天模式与任务模式）的自动权限审批 + 消息排队油猴脚本：自动放行权限卡片、支持生成中回车消息排队（逐条发送 / 与上条合并自由混排）、SPA 切会话状态重置与多标签运行总览。
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v2.2.0-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v2.2.0"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v3.0.0-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v3.0.0"></a>
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v2.2.0-3776AB?style=flat-square" alt="Version v2.2.0"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v3.0.0-3776AB?style=flat-square" alt="Version v3.0.0"></a>
   <img src="https://img.shields.io/badge/Target-gemini.google.com-4B5563?style=flat-square" alt="Target gemini.google.com">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E?style=flat-square" alt="License: MIT"></a>
 </p>
 
-## 解决的问题
+## 核心功能（v3.0.0）
 
-新版 Gemini 网页端更新了权限审批组件，导致早期脚本（如仅匹配 `/spark*` 与 `remy-confirmation-card` 的脚本）失效：
+1. **全覆盖自动审批**
+   - 同时监听 `remy-confirmation-card`、`remy-confirmation-card-v2`、`spark-waiting-for-user-banner` 以及 `[role="dialog"]` / `[role="alertdialog"]`（内置删除对话/清空记录类危险弹窗黑名单防误点）。
+   - 放宽按钮前缀匹配，兼容带工具名/角标的按钮（如「始终允许 @mac3」「Always allow for ...」「允许一次 (shell)」），并优先排除「不允许 / Don't allow」。
+   - 自动补发滞留在输入框里的审批文本，防止后台失焦态下点击后卡住不提交。
+2. **输入消息排队（Prompt Queue）**
+   - Gemini 回复生成中、等待审批或已有排队项时，在输入框直接打字按 **Enter**（或点击发送），内容会立刻收进**输入框正上方的排队浮层**，不再被吞掉或干等；空闲时按 `Alt + Enter` 也可强制先入队。
+   - **合并 / 逐条自由混排**：
+     - 顶部可一键切换默认行为：`✂️ 逐条发` 或 `🔗 合并上条`；
+     - 队列中除第 1 条外，每一条都可单独点 `🔗 合并` / `✂️ 独立` 实时切换。相邻的 `🔗 合并` 条目会归入同一轮拼成一条发送，`✂️ 独立` 条目则等 Gemini 回复完上一轮再发。
+   - 支持 **⏸ 暂停派发 / ▶ 继续派发**、**⚡ 立即发下轮**、**上移排序**、**双击/点击编辑**、**删除**，并按当前会话路径隔离持久化到 `sessionStorage`。
+   - 派发时使用 Quill 兼容注入 + 发送校验重试，确保内容真正发出后再出队；有排队消息时优先发队列，不会被自动“继续”插队。
+3. **SPA 切会话状态重置 + 独立开关**
+   - 监听 `history.pushState` / `replaceState` / `popstate`，切换对话时自动重置连续“继续”计数并加载目标会话的排队列表。
+   - 右下角控制台可独立开关「自动审批」「回退允许」「消息排队」「默认合并」「自动继续」「标签页标题状态」，所有设置持久化到 `localStorage`。
+4. **多标签状态总览**
+   - 通过 `BroadcastChannel` 跨标签同步同源 Gemini 标签页状态，点击右下角胶囊可一眼看到所有标签处于「运行中 / 卡审批 / 排队中 / 空闲 / 可能已冻结」。
+   - 标签页标题自动附加状态前缀（`[⏳审批]`、`[📋排队N]`、`[⚡运行]`），不用切标签也能发现异常。
 
-| 维度 | 旧版界面 | 当前新版界面 | 本脚本适配策略 |
-|---|---|---|---|
-| 页面路由 | `/spark*` | `/app*`、`/u/*/app*`、`/spark*` | 匹配 `https://gemini.google.com/*` |
-| 卡片元素 | `remy-confirmation-card` | `remy-confirmation-card-v2` | 同时监听 v1 与 v2 组件 |
-| 按钮定位 | `gem-button[data-test-id=...]` | 已移除 `data-test-id` | 基于按钮启用状态与中英文文案识别 |
-| 聊天模式 MCP 审批 | 两按钮（允许 / 拒绝） | 三按钮（不允许 / 允许一次 / 始终允许） | 优先点击「始终允许 / Always allow」 |
-| 任务模式 / 运行命令 | 两按钮（允许 / 拒绝） | 两按钮（拒绝 / 允许） | 自动回退点击「允许 / Allow」（可配置） |
+## 后台多标签防冻结建议
+
+由于 Chromium 内核会对后台标签页启用「内存节省程序（Tab Freeze）」并节流定时器，若同时挂多个 Gemini 任务标签，建议在浏览器设置中将 `gemini.google.com` 加入始终保持活跃名单：
+
+- **Chrome / Edge / Dia**：打开 `chrome://settings/performance` → 在「始终让这些网站保持活跃状态」中添加 `gemini.google.com`。
 
 ## 一键安装
 
-1. 先在浏览器安装用户脚本管理器：[Tampermonkey](https://www.tampermonkey.net/)、[Violentmonkey](https://violentmonkey.github.io/) 或 [ScriptCat](https://docs.scriptcat.org/)。
-2. 点击下方安装按钮，扩展会自动弹出脚本安装确认页（后续将通过 `@updateURL` 自动检查更新）：
-
-[![点击一键安装 v2.2.0](https://img.shields.io/badge/%E7%82%B9%E5%87%BB%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85-gemini--mcp--auto--allow.user.js-2B5B84?style=for-the-badge)](https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js)
-
-3. 手动安装备选：打开 [`gemini-mcp-auto-allow.user.js`](./gemini-mcp-auto-allow.user.js) 点击 **Raw**，或复制代码到脚本管理器中新建保存。
-
-## 快速上手
-
-1. 安装并启用脚本后，打开或刷新 `https://gemini.google.com/`（支持多账号路径 `/u/0/`、`/u/2/` 等）。
-2. 当聊天模式或任务模式出现工具调用 / 命令执行确认卡片时，脚本会在约 `150ms` 后自动点击目标按钮，并在浏览器控制台输出日志：
-   - `[Gemini Auto Allow] 已自动点击「始终允许」`
-   - `[Gemini Auto Allow] 已自动点击「允许」`
-3. 按钮点击优先级：
-   1. `始终允许` / `总是允许` / `Always allow`
-   2. `在此对话中允许` / `Allow for this chat`
-   3. `允许一次` / `允许` / `Allow once` / `Allow`
-
-## 可选配置
-
-在脚本顶部可直接修改以下常量：
-
-```javascript
-const CLICK_DELAY_MS = 150;
-// 若卡片没有“始终允许”，是否回退点击“在此对话中允许”或“允许 / 允许一次”
-const FALLBACK_TO_CHAT_OR_ONCE = true;
-```
-
-- 如果你希望**只自动点击「始终允许」**，而把只有「拒绝 / 允许」的命令执行卡片留给人工确认，请将 `FALLBACK_TO_CHAT_OR_ONCE` 改为 `false`。
+1. 安装用户脚本管理器：[Tampermonkey](https://www.tampermonkey.net/)、[Violentmonkey](https://violentmonkey.github.io/) 或 [ScriptCat](https://docs.scriptcat.org/)。
+2. 点击上方「一键安装 Userscript」按钮，或直接打开 [`gemini-mcp-auto-allow.user.js`](./gemini-mcp-auto-allow.user.js) 点击 **Raw** 安装。
 
 ## 安全提示
 
-自动放行「始终允许」与「运行命令 -> 允许」会让 Gemini 在无人工确认的情况下直接调用已连接的 MCP 工具或执行命令。请仅在个人可控或隔离环境中长期启用。
+自动放行「始终允许」与「允许」会让 Gemini 在无人工确认的情况下调用已连接的 MCP 工具或执行命令。请仅在个人可控或隔离环境中长期启用。
 
 ## 致谢与许可证
 
-- 思路参考了 Greasyfork 上的早期脚本 [Gemini Spark MCP Auto Allow (#593120)](https://greasyfork.org/en/scripts/593120-gemini-spark-mcp-auto-allow)（MIT License）。
+- 早期思路参考 Greasyfork 脚本 [Gemini Spark MCP Auto Allow (#593120)](https://greasyfork.org/en/scripts/593120-gemini-spark-mcp-auto-allow)（MIT License）。
 - 本项目基于 [MIT License](./LICENSE) 开源。

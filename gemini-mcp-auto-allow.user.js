@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Gemini MCP & Task Auto Always Allow (+ Auto Continue)
+// @name         Gemini MCP & Task Auto Always Allow (+ Prompt Queue & Multi-Tab)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      2.3.4
-// @description  Automatically clicks "始终允许" (Always allow) on Gemini confirmation cards, and optionally auto-replies "继续" when Gemini asks to proceed.
+// @version      3.0.0
+// @description  自动放行 Gemini 工具/任务权限审批卡片；支持生成中回车消息排队（逐条发送/与上条合并自由切换）、SPA 切会话状态重置与多标签状态总览。
 // @author       myh333777
 // @match        https://gemini.google.com/*
 // @homepageURL  https://github.com/myh333777/gemini-auto-allow-userscript
@@ -17,153 +17,216 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '2.3.4';
+  const SCRIPT_VERSION = '3.0.0';
+  const STORAGE_SETTINGS_KEY = 'gemini_aa_settings_v3';
+  const STORAGE_QUEUE_PREFIX = 'gemini_aa_queue_v3:';
+  const TAB_CHANNEL_NAME = 'gemini-auto-allow-v3-tabs';
+  const TAB_ID = `tab_${Math.random().toString(36).slice(2, 9)}`;
 
-  // ==================== 配置项 ====================
-  const CLICK_DELAY_MS = 200; // 仅前台使用；后台标签页立即点击
+  // ==================== 基础参数 ====================
+  const CLICK_DELAY_MS = 180; // 前台点击轻微防抖；后台立即点击
   const RETRY_COOLDOWN_MS = 1500;
   const MAX_RETRIES = 5;
-  const FALLBACK_POLL_MS = 2000;
-  // 若卡片没有“始终允许”，是否回退点击“在此对话中允许”或“允许 / 允许一次”
-  const FALLBACK_TO_CHAT_OR_ONCE = true;
-
-  // -------- 自动回复“继续”配置 --------
-  const AUTO_CONTINUE_DEFAULT = true; // 初始是否开启自动“继续”（可在右下角小胶囊一键切换）
+  const FALLBACK_POLL_MS = 1800;
   const CONTINUE_TEXT = '继续';
-  const CONTINUE_STABLE_MS = 1800; // 模型停止输出后，等待文本稳定多久再发送
-  const MAX_CONSECUTIVE_CONTINUES = 10; // 单次会话连续自动“继续”上限，防止无限循环耗尽额度
-  const SHOW_STATUS_BADGE = true; // 是否在右下角显示极简状态胶囊
-  // ==============================================
+  const CONTINUE_STABLE_MS = 2000;
+  const MAX_CONSECUTIVE_CONTINUES = 10;
+  const QUEUE_DISPATCH_STABLE_MS = 1300;
+  const POST_DISPATCH_COOLDOWN_MS = 3200;
+  const STUCK_APPROVAL_SEND_DELAY_MS = 600;
+  // ================================================
 
-  const CARD_SELECTOR = 'remy-confirmation-card, remy-confirmation-card-v2';
+  const DEFAULT_SETTINGS = {
+    autoApprove: true,
+    fallbackToChatOrOnce: true,
+    autoContinue: true,
+    queueEnabled: true,
+    queueMergeByDefault: false, // false = 默认逐条独立发；true = 默认合并到上一条
+    titleStatusEnabled: true,
+  };
 
-  // 确认这是一张工具/权限审批卡片（必须同时存在拒绝/取消类按钮，避免误点普通横幅）
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(STORAGE_SETTINGS_KEY);
+      if (raw) {
+        return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+      }
+    } catch (_) {
+      // 忽略隐私模式或存储异常
+    }
+    return { ...DEFAULT_SETTINGS };
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify(settings));
+    } catch (_) {
+      // 忽略存储异常
+    }
+  }
+
+  const settings = loadSettings();
+
+  // ==================== 审批选择器与文案规则 ====================
+  const PRIMARY_CARD_SELECTOR =
+    'remy-confirmation-card, remy-confirmation-card-v2, spark-waiting-for-user-banner';
+  const DIALOG_SELECTOR = '[role="dialog"], [role="alertdialog"]';
+
+  // 危险弹窗黑名单：对通用 dialog 生效，绝不自动点击
+  const DANGEROUS_DIALOG_PATTERN =
+    /(?:删除此对话|删除对话|永久删除|删除记录|清空记录|清除历史|退出登录|注销账号|反馈问题|举报|delete\s+(?:this\s+)?chat|delete\s+conversation|permanently\s+delete|clear\s+history|sign\s+out|log\s+out|report\s+legal)/i;
+
+  // 拒绝/取消类按钮（用于确认这是权限审批卡片，同时用于排除误匹配）
   const DENY_PATTERNS = [
-    /^(不允许|拒绝|取消|不同意)$/i,
-    /^(deny|don['’]t allow|disallow|decline|cancel|reject)$/i,
+    /^(不允许|拒绝|取消|不同意|暂不允许|禁止)(?:\s|$|[（(@·\-:：])/i,
+    /^(deny|don['’]t\s+allow|disallow|decline|cancel|reject)\b/i,
   ];
 
-  // 按钮点击优先级：始终允许 > 本次对话允许 > 允许/允许一次
+  // 优先级 1：始终允许（放宽前缀匹配，兼容“始终允许 @mac3”等带工具名/角标的按钮）
   const ALWAYS_ALLOW_PATTERNS = [
-    /^(始终允许|总是允许)$/i,
-    /^(always allow|allow always)$/i,
+    /^(始终允许|总是允许|永久允许)(?:\s|$|[（(@·\-:：])/i,
+    /^(always\s+allow|allow\s+always)\b/i,
   ];
 
+  // 优先级 2：本对话允许 / 允许一次 / 允许
   const FALLBACK_ALLOW_PATTERNS = [
-    /^(在此对话中允许|本对话允许)$/i,
-    /^allow for this chat$/i,
-    /^(允许一次|允许|同意)$/i,
-    /^(allow once|allow|approve)$/i,
+    /^(在此对话中允许|本对话允许|本次对话允许)(?:\s|$|[（(@·\-:：])/i,
+    /^allow\s+for\s+this\s+(?:chat|conversation)\b/i,
+    /^(允许一次|允许|同意|批准|继续运行)(?:\s|$|[（(@·\-:：])/i,
+    /^(allow\s+once|allow|approve)\b/i,
   ];
 
-  // 识别“请求回复继续 / 确认进入下一步”的模糊匹配规则（按单句判定，同句共现即命中）
+  // 识别“请求回复继续 / 确认进入下一步”的规则（收紧到最后 800 字内明确提问句）
   const CONTINUE_SENTENCE_RULES = [
-    // 同句共现：回复/输入/发送/确认/告知 + 继续/下一步/proceed/continue
     {
-      a: /(?:回复|输入|发送|告诉|说一声|回个|确认|同意|告知|reply|type|say|send|confirm)/i,
+      a: /(?:回复|输入|发送|告诉|说一声|回个|确认|告知|reply|type|say|send|confirm)/i,
       b: /(?:继续|下一步|往下|接着|proceed|continue)/i,
     },
-    // 同句共现：询问是否继续
     {
-      a: /(?:是否|要我|需要我|要不要|能否|可以|准备好|没问题|shall\s+i|should\s+i|would\s+you\s+like|want\s+me\s+to)/i,
+      a: /(?:是否|要我|需要我|要不要|能否|准备好|shall\s+i|should\s+i|would\s+you\s+like|want\s+me\s+to)/i,
       b: /(?:继续|下一步|往下|接着|proceed|continue)/i,
     },
-    // 兜底短句：直接以“继续吗？”、“下一步？”、“continue?”结尾
     {
       a: /(?:继续|下一步|proceed|continue)\s*[吗？?]\s*$/i,
       b: /(?:继续|下一步|proceed|continue)/i,
     },
   ];
 
-  // 否定/无法继续的句子不触发
-  const CONTINUE_NEGATIVE_PATTERN = /(?:无法|不能|不再|暂停|停止|不要|不必|无需|别|勿|don['’]t|cannot|can['’]t|unable\s+to)\s*(?:继续|proceed|continue)/i;
+  const CONTINUE_NEGATIVE_PATTERN =
+    /(?:无法|不能|不再|暂停|停止|不要|不必|无需|别|勿|don['’]t|cannot|can['’]t|unable\s+to)\s*(?:继续|proceed|continue)/i;
+  // ==============================================================
 
+  // ==================== 运行时状态 ====================
   const buttonState = new WeakMap();
   const stuckSendState = new WeakMap();
-  const STUCK_APPROVAL_SEND_DELAY_MS = 600;
+  let currentPath = location.pathname;
   let scanScheduled = false;
   let clickCount = 0;
-  let autoContinueEnabled = AUTO_CONTINUE_DEFAULT;
+
+  // 自动继续状态（切会话自动重置）
   let consecutiveContinues = 0;
   let lastHandledResponseKey = '';
   let pendingContinueTimer = null;
   let pendingContinueCandidateKey = '';
-  let badgeEl = null;
 
-  function markInjected() {
-    if (document.documentElement) {
-      document.documentElement.dataset.geminiAutoAllow = SCRIPT_VERSION;
-      document.documentElement.dataset.geminiAutoAllowClicks = String(clickCount);
-      document.documentElement.dataset.geminiAutoContinue = String(autoContinueEnabled);
-    }
-    updateBadge();
-  }
+  // 消息排队状态（按会话路径隔离并持久化）
+  let queue = [];
+  let queuePaused = false;
+  let isScriptSubmitting = false;
+  let queueDispatchTimer = null;
+  let lastDispatchAt = 0;
+  let lastDispatchUserQueryCount = 0;
+  let editingItemId = null;
 
-  function ensureBadge() {
-    if (!SHOW_STATUS_BADGE || badgeEl || !document.body) {
-      return;
-    }
-    badgeEl = document.createElement('button');
-    badgeEl.type = 'button';
-    badgeEl.id = 'gemini-auto-allow-badge';
-    badgeEl.title = '点击切换：自动回复“继续”开关';
-    Object.assign(badgeEl.style, {
-      position: 'fixed',
-      right: '14px',
-      bottom: '12px',
-      zIndex: '99999',
-      padding: '4px 10px',
-      borderRadius: '999px',
-      border: '1px solid rgba(128,128,128,0.28)',
-      background: 'rgba(28, 28, 32, 0.78)',
-      color: '#e8eaed',
-      fontSize: '11px',
-      lineHeight: '16px',
-      fontFamily: 'system-ui, -apple-system, sans-serif',
-      cursor: 'pointer',
-      backdropFilter: 'blur(6px)',
-      opacity: '0.72',
-      transition: 'opacity 0.15s ease',
-    });
-    badgeEl.addEventListener('mouseenter', () => {
-      badgeEl.style.opacity = '1';
-    });
-    badgeEl.addEventListener('mouseleave', () => {
-      badgeEl.style.opacity = '0.72';
-    });
-    badgeEl.addEventListener('click', () => {
-      autoContinueEnabled = !autoContinueEnabled;
-      if (autoContinueEnabled) {
-        consecutiveContinues = 0;
-      } else if (pendingContinueTimer) {
-        clearTimeout(pendingContinueTimer);
-        pendingContinueTimer = null;
-      }
-      markInjected();
-    });
-    document.body.appendChild(badgeEl);
-  }
+  // 多标签状态同步
+  const peerTabs = new Map();
+  let tabChannel = null;
+  let basePageTitle = document.title || 'Gemini';
 
-  function updateBadge() {
-    if (!SHOW_STATUS_BADGE) {
-      return;
-    }
-    ensureBadge();
-    if (!badgeEl) {
-      return;
-    }
-    const contText = autoContinueEnabled
-      ? `自动继续:开(${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES})`
-      : '自动继续:关';
-    badgeEl.textContent = `自动允许:${clickCount} | ${contText}`;
-  }
+  // UI 节点引用
+  let uiRoot = null;
+  let badgeBtn = null;
+  let popoverEl = null;
+  let popoverOpen = false;
+  let queueDockEl = null;
+  let lastQueueRenderKey = '';
+  // ==================================================
 
+  // ==================== 通用工具函数 ====================
   function normalizeText(element) {
     return (element?.textContent || '').replace(/\s+/g, ' ').trim();
   }
 
   function matchesAny(text, patterns) {
     return patterns.some((re) => re.test(text));
+  }
+
+  function getConversationKey() {
+    return location.pathname || '/app';
+  }
+
+  function loadQueueForCurrentChat() {
+    try {
+      const raw = sessionStorage.getItem(STORAGE_QUEUE_PREFIX + getConversationKey());
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          queue = parsed
+            .filter((item) => item && typeof item.text === 'string' && item.text.trim())
+            .map((item, idx) => ({
+              id: item.id || `q_${Date.now()}_${idx}`,
+              text: item.text,
+              mergeWithPrev: idx === 0 ? false : Boolean(item.mergeWithPrev),
+              createdAt: item.createdAt || Date.now(),
+            }));
+          return;
+        }
+      }
+    } catch (_) {
+      // 忽略存储异常
+    }
+    queue = [];
+  }
+
+  function saveQueueForCurrentChat() {
+    normalizeQueueFlags();
+    try {
+      const key = STORAGE_QUEUE_PREFIX + getConversationKey();
+      if (queue.length === 0) {
+        sessionStorage.removeItem(key);
+      } else {
+        sessionStorage.setItem(key, JSON.stringify(queue));
+      }
+    } catch (_) {
+      // 忽略存储异常
+    }
+  }
+
+  function normalizeQueueFlags() {
+    if (queue.length > 0 && queue[0].mergeWithPrev) {
+      queue[0].mergeWithPrev = false;
+    }
+  }
+
+  function isElementVisible(el) {
+    if (!el || !el.isConnected) {
+      return false;
+    }
+    const style = window.getComputedStyle(el);
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      parseFloat(style.opacity || '1') === 0
+    ) {
+      return false;
+    }
+    if (!document.hidden) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) {
+        return false;
+      }
+    }
+    return true;
   }
 
   function isButtonEnabled(button) {
@@ -181,22 +244,230 @@
     ) {
       return false;
     }
-    const style = window.getComputedStyle(button);
-    if (
-      style.display === 'none' ||
-      style.visibility === 'hidden' ||
-      parseFloat(style.opacity || '1') === 0
-    ) {
+    return isElementVisible(button);
+  }
+
+  function triggerClick(button) {
+    const eventInit = { bubbles: true, cancelable: true, view: window };
+    try {
+      if (typeof PointerEvent === 'function') {
+        button.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+        button.dispatchEvent(new PointerEvent('pointerup', eventInit));
+      }
+      button.dispatchEvent(new MouseEvent('mousedown', eventInit));
+      button.dispatchEvent(new MouseEvent('mouseup', eventInit));
+    } catch (_) {
+      // 忽略构造事件异常，继续原生 click()
+    }
+    button.click();
+  }
+
+  function getEditor() {
+    return document.querySelector(
+      'rich-textarea .ql-editor, [contenteditable="true"][role="textbox"], textarea[aria-label*="prompt" i]'
+    );
+  }
+
+  function getEditorRawText(editor) {
+    if (!editor) {
+      return '';
+    }
+    if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+      return (editor.value || '').trim();
+    }
+    // 保留多行换行结构
+    const text = (editor.innerText || editor.textContent || '')
+      .replace(/\u200B/g, '')
+      .replace(/\r\n/g, '\n');
+    return text.trim();
+  }
+
+  function clearEditor(editor) {
+    if (!editor) {
+      return;
+    }
+    if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+      editor.value = '';
+    } else {
+      const p = document.createElement('p');
+      p.appendChild(document.createElement('br'));
+      editor.replaceChildren(p);
+      editor.classList.add('ql-blank');
+    }
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    editor.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function setEditorText(editor, text) {
+    if (!editor) {
       return false;
     }
-    // 后台标签页或未完成 layout 时不做死卡，前台才校验包围盒尺寸
     if (!document.hidden) {
-      const rect = button.getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) {
-        return false;
+      try {
+        editor.focus();
+      } catch (_) {
+        // 忽略失焦异常
       }
     }
+
+    if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+      editor.value = text;
+    } else {
+      const lines = text.split('\n');
+      const nodes = lines.map((line) => {
+        const p = document.createElement('p');
+        if (line.length === 0) {
+          p.appendChild(document.createElement('br'));
+        } else {
+          p.textContent = line;
+        }
+        return p;
+      });
+      editor.replaceChildren(...nodes);
+      editor.classList.remove('ql-blank');
+    }
+
+    try {
+      editor.dispatchEvent(
+        new InputEvent('input', {
+          bubbles: true,
+          cancelable: true,
+          inputType: 'insertText',
+          data: text,
+        })
+      );
+    } catch (_) {
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    editor.dispatchEvent(new Event('change', { bubbles: true }));
     return true;
+  }
+
+  function getSendButton() {
+    const candidates = document.querySelectorAll(
+      'button.send-button, button[aria-label*="Send"], button[aria-label*="发送"], button[data-test-id="send-button"]'
+    );
+    for (const btn of candidates) {
+      if (!btn.closest('#gemini-aa-root') && isElementVisible(btn)) {
+        return btn;
+      }
+    }
+    return candidates[0] || null;
+  }
+
+  function isGenerating() {
+    const stopCandidates = document.querySelectorAll(
+      'button[aria-label*="Stop"], button[aria-label*="停止"], .stop-icon, button[data-test-id="stop-button"]'
+    );
+    for (const el of stopCandidates) {
+      if (!el.closest('#gemini-aa-root') && isElementVisible(el)) {
+        return true;
+      }
+    }
+    if (document.querySelector('model-response[aria-busy="true"], .response-streaming')) {
+      return true;
+    }
+    return false;
+  }
+
+  function getUserQueryCount() {
+    return document.querySelectorAll('user-query, .user-query-container').length;
+  }
+
+  // 稳健填充并提交：等待发送按钮激活 + 滞留自动重试
+  function fillAndSubmitPrompt(text, onDone) {
+    const editor = getEditor();
+    if (!editor) {
+      if (onDone) onDone(false);
+      return false;
+    }
+    if (getEditorRawText(editor).length > 0) {
+      if (onDone) onDone(false);
+      return false;
+    }
+
+    isScriptSubmitting = true;
+    lastDispatchAt = Date.now();
+    lastDispatchUserQueryCount = getUserQueryCount();
+    setEditorText(editor, text);
+
+    let attempts = 0;
+    const maxAttempts = 6;
+
+    const finish = (ok) => {
+      isScriptSubmitting = false;
+      if (ok) {
+        lastDispatchAt = Date.now();
+      }
+      if (onDone) onDone(ok);
+    };
+
+    const trySubmit = () => {
+      attempts += 1;
+      const currentEditor = getEditor();
+      if (!currentEditor) {
+        finish(false);
+        return;
+      }
+      // 如果输入框已经被清空或者已经进入生成态，说明已经成功提交
+      if (getEditorRawText(currentEditor).length === 0 || isGenerating()) {
+        finish(true);
+        return;
+      }
+
+      const sendBtn = getSendButton();
+      if (sendBtn && isButtonEnabled(sendBtn)) {
+        triggerClick(sendBtn);
+      } else if (attempts >= 3) {
+        currentEditor.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true,
+          })
+        );
+      }
+
+      window.setTimeout(() => {
+        const afterEditor = getEditor();
+        const cleared = !afterEditor || getEditorRawText(afterEditor).length === 0;
+        const started = isGenerating() || getUserQueryCount() > lastDispatchUserQueryCount;
+        if (cleared || started) {
+          finish(true);
+        } else if (attempts < maxAttempts) {
+          trySubmit();
+        } else {
+          finish(false);
+        }
+      }, 360);
+    };
+
+    window.setTimeout(trySubmit, 120);
+    return true;
+  }
+
+  // ==================== 模块 1：自动审批 ====================
+  function collectConfirmationContainers() {
+    const set = new Set();
+    document.querySelectorAll(PRIMARY_CARD_SELECTOR).forEach((el) => {
+      if (!el.closest('#gemini-aa-root')) {
+        set.add(el);
+      }
+    });
+    document.querySelectorAll(DIALOG_SELECTOR).forEach((el) => {
+      if (el.closest('#gemini-aa-root')) {
+        return;
+      }
+      const text = normalizeText(el);
+      if (DANGEROUS_DIALOG_PATTERN.test(text)) {
+        return;
+      }
+      set.add(el);
+    });
+    return [...set];
   }
 
   function findTargetButton(card) {
@@ -212,7 +483,17 @@
       return null;
     }
 
-    const enabledButtons = buttons.filter(isButtonEnabled);
+    const enabledButtons = buttons.filter((btn) => {
+      if (!isButtonEnabled(btn)) {
+        return false;
+      }
+      const txt = normalizeText(btn);
+      if (!txt || matchesAny(txt, DENY_PATTERNS)) {
+        return false;
+      }
+      return true;
+    });
+
     for (const pattern of ALWAYS_ALLOW_PATTERNS) {
       const match = enabledButtons.find((btn) =>
         pattern.test(normalizeText(btn))
@@ -222,7 +503,7 @@
       }
     }
 
-    if (FALLBACK_TO_CHAT_OR_ONCE) {
+    if (settings.fallbackToChatOrOnce) {
       for (const pattern of FALLBACK_ALLOW_PATTERNS) {
         const match = enabledButtons.find((btn) =>
           pattern.test(normalizeText(btn))
@@ -236,22 +517,20 @@
     return null;
   }
 
-  function triggerClick(button) {
-    const eventInit = { bubbles: true, cancelable: true, view: window };
-    try {
-      if (typeof PointerEvent === 'function') {
-        button.dispatchEvent(new PointerEvent('pointerdown', eventInit));
-        button.dispatchEvent(new PointerEvent('pointerup', eventInit));
+  function hasPendingConfirmationCard() {
+    const cards = collectConfirmationContainers();
+    for (const card of cards) {
+      if (findTargetButton(card)) {
+        return true;
       }
-      button.dispatchEvent(new MouseEvent('mousedown', eventInit));
-      button.dispatchEvent(new MouseEvent('mouseup', eventInit));
-    } catch (_) {
-      // 忽略构造事件异常，继续执行原生 click()
     }
-    button.click();
+    return false;
   }
 
   function handleCard(card) {
+    if (!settings.autoApprove) {
+      return;
+    }
     const targetButton = findTargetButton(card);
     if (!targetButton) {
       return;
@@ -278,6 +557,9 @@
 
     const doClick = () => {
       state.pending = false;
+      if (!settings.autoApprove) {
+        return;
+      }
       if (isButtonEnabled(targetButton) && findTargetButton(card) === targetButton) {
         state.attempts += 1;
         state.lastAttemptAt = Date.now();
@@ -299,168 +581,9 @@
     }
   }
 
-  // ==================== 自动回复“继续”模块 ====================
-  function isGenerating() {
-    return Boolean(
-      document.querySelector(
-        'button[aria-label*="Stop"], button[aria-label*="停止"], .stop-icon'
-      )
-    );
-  }
-
-  function hasPendingConfirmationCard() {
-    const cards = document.querySelectorAll(CARD_SELECTOR);
-    for (const card of cards) {
-      if (findTargetButton(card)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function getLastModelResponseInfo() {
-    const responses = [...document.querySelectorAll('model-response')];
-    if (responses.length === 0) {
-      return null;
-    }
-    const last = responses[responses.length - 1];
-    // 如果最后一条还包含未完成的权限卡片，先不发“继续”
-    if (last.querySelector(CARD_SELECTOR) && hasPendingConfirmationCard()) {
-      return null;
-    }
-    const contentEl = last.querySelector('message-content') || last;
-    const fullText = normalizeText(contentEl);
-    if (!fullText) {
-      return null;
-    }
-    const tail = fullText.slice(-1200);
-    const key = `${responses.length}:${fullText.length}:${tail.slice(-80)}`;
-    return { key, tail };
-  }
-
-  function sendContinueReply() {
-    const editor = document.querySelector(
-      'rich-textarea .ql-editor, [contenteditable="true"][role="textbox"]'
-    );
-    if (!editor) {
-      return false;
-    }
-    // 如果用户正在输入框里打字，绝不覆盖用户输入
-    if (normalizeText(editor).length > 0) {
-      return false;
-    }
-
-    editor.focus();
-    editor.textContent = CONTINUE_TEXT;
-    editor.dispatchEvent(new Event('input', { bubbles: true }));
-
-    const tryClickSend = () => {
-      const sendBtn = document.querySelector(
-        'button.send-button, button[aria-label*="Send"], button[aria-label*="发送"]'
-      );
-      if (sendBtn && isButtonEnabled(sendBtn)) {
-        triggerClick(sendBtn);
-        return true;
-      }
-      // 兜底：派发 Enter 键提交
-      editor.dispatchEvent(
-        new KeyboardEvent('keydown', {
-          key: 'Enter',
-          code: 'Enter',
-          keyCode: 13,
-          which: 13,
-          bubbles: true,
-          cancelable: true,
-        })
-      );
-      return true;
-    };
-
-    window.setTimeout(tryClickSend, 120);
-    return true;
-  }
-
-  function matchesContinueTail(tail) {
-    // 按句子拆分，检查末尾 1200 字内的句子（覆盖“小标题写回复继续 + 下方列清单”的格式）
-    const sentences = tail
-      .split(/[\n。！？!?；;]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    return sentences.some((sentence) => {
-      if (CONTINUE_NEGATIVE_PATTERN.test(sentence)) {
-        return false;
-      }
-      return CONTINUE_SENTENCE_RULES.some(
-        (rule) => rule.a.test(sentence) && rule.b.test(sentence)
-      );
-    });
-  }
-
-  function checkAutoContinue() {
-    if (!autoContinueEnabled) {
-      return;
-    }
-    if (consecutiveContinues >= MAX_CONSECUTIVE_CONTINUES) {
-      return;
-    }
-    if (isGenerating() || hasPendingConfirmationCard()) {
-      if (pendingContinueTimer) {
-        clearTimeout(pendingContinueTimer);
-        pendingContinueTimer = null;
-      }
-      return;
-    }
-
-    const info = getLastModelResponseInfo();
-    if (!info || info.key === lastHandledResponseKey) {
-      return;
-    }
-
-    if (!matchesContinueTail(info.tail)) {
-      return;
-    }
-
-    if (pendingContinueCandidateKey === info.key && pendingContinueTimer) {
-      return;
-    }
-
-    if (pendingContinueTimer) {
-      clearTimeout(pendingContinueTimer);
-    }
-    pendingContinueCandidateKey = info.key;
-
-    const executeContinue = () => {
-      pendingContinueTimer = null;
-      if (!autoContinueEnabled || isGenerating() || hasPendingConfirmationCard()) {
-        return;
-      }
-      const latest = getLastModelResponseInfo();
-      if (!latest || latest.key !== info.key || latest.key === lastHandledResponseKey) {
-        return;
-      }
-      if (sendContinueReply()) {
-        lastHandledResponseKey = latest.key;
-        consecutiveContinues += 1;
-        markInjected();
-        console.info(
-          `[Gemini Auto Allow] 检测到继续提示，已自动回复「${CONTINUE_TEXT}」（${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES}）`
-        );
-      }
-    };
-
-    if (document.hidden) {
-      executeContinue();
-    } else {
-      pendingContinueTimer = window.setTimeout(executeContinue, CONTINUE_STABLE_MS);
-    }
-  }
-  // ==============================================================
-
-  // ==================== 滞留审批文本自动补发 ====================
-  // Gemini 部分新版 MCP 卡片在点击“始终允许/允许”后，会把文案填入输入框但偶发不自动提交
+  // 滞留审批文本自动补发（点击允许后偶发卡在输入框未提交）
   function flushStuckApprovalInput() {
-    if (isGenerating() || hasPendingConfirmationCard()) {
+    if (!settings.autoApprove || isScriptSubmitting || isGenerating() || hasPendingConfirmationCard()) {
       return;
     }
 
@@ -469,29 +592,26 @@
       return;
     }
     const lastResp = responses[responses.length - 1];
-    const card = lastResp.querySelector(CARD_SELECTOR);
+    const card = lastResp.querySelector(PRIMARY_CARD_SELECTOR);
     if (!card) {
       return;
     }
 
-    const editor = document.querySelector(
-      'rich-textarea .ql-editor, [contenteditable="true"][role="textbox"]'
-    );
+    const editor = getEditor();
     if (!editor) {
       return;
     }
-    const editorText = normalizeText(editor);
+    const editorText = getEditorRawText(editor);
     if (
       !editorText ||
+      matchesAny(editorText, DENY_PATTERNS) ||
       (!matchesAny(editorText, ALWAYS_ALLOW_PATTERNS) &&
         !matchesAny(editorText, FALLBACK_ALLOW_PATTERNS))
     ) {
       return;
     }
 
-    const sendBtn = document.querySelector(
-      'button.send-button, button[aria-label*="Send"], button[aria-label*="发送"]'
-    );
+    const sendBtn = getSendButton();
     if (!sendBtn || !isButtonEnabled(sendBtn)) {
       return;
     }
@@ -515,16 +635,14 @@
 
     const doSend = () => {
       state.pending = false;
-      if (isGenerating() || hasPendingConfirmationCard()) {
+      if (isGenerating() || hasPendingConfirmationCard() || isScriptSubmitting) {
         return;
       }
-      const currentText = normalizeText(editor);
+      const currentText = getEditorRawText(editor);
       if (currentText !== editorText) {
         return;
       }
-      const currentSendBtn = document.querySelector(
-        'button.send-button, button[aria-label*="Send"], button[aria-label*="发送"]'
-      );
+      const currentSendBtn = getSendButton();
       if (!currentSendBtn || !isButtonEnabled(currentSendBtn)) {
         return;
       }
@@ -534,7 +652,7 @@
 
       triggerClick(currentSendBtn);
       console.info(
-        `[Gemini Auto Allow] 检测到滞留输入框的审批文本「${editorText}」，已自动点击发送（第 ${state.attempts} 次尝试）`
+        `[Gemini Auto Allow] 检测到滞留审批文本「${editorText}」，已自动补发（第 ${state.attempts} 次）`
       );
     };
 
@@ -544,13 +662,1274 @@
       window.setTimeout(doSend, STUCK_APPROVAL_SEND_DELAY_MS);
     }
   }
-  // ==============================================================
 
+  // ==================== 模块 2：消息排队（Prompt Queue） ====================
+  function getNextDispatchBatch(items) {
+    if (!items || items.length === 0) {
+      return null;
+    }
+    let endIdx = 1;
+    while (endIdx < items.length && items[endIdx].mergeWithPrev) {
+      endIdx += 1;
+    }
+    const batchItems = items.slice(0, endIdx);
+    const combinedText = batchItems.map((it) => it.text).join('\n\n');
+    return {
+      items: batchItems,
+      count: endIdx,
+      combinedText,
+    };
+  }
+
+  function enqueuePrompt(text, forceMerge) {
+    const cleaned = (text || '').trim();
+    if (!cleaned) {
+      return false;
+    }
+    const shouldMerge =
+      queue.length > 0 &&
+      (typeof forceMerge === 'boolean' ? forceMerge : settings.queueMergeByDefault);
+
+    queue.push({
+      id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      text: cleaned,
+      mergeWithPrev: shouldMerge,
+      createdAt: Date.now(),
+    });
+    saveQueueForCurrentChat();
+    renderQueueDock();
+    markInjected();
+    scheduleScan();
+    return true;
+  }
+
+  function shouldInterceptForQueue(forceQueue) {
+    if (!settings.queueEnabled) {
+      return false;
+    }
+    if (isScriptSubmitting) {
+      return false;
+    }
+    if (forceQueue) {
+      return true;
+    }
+    // 正在生成、存在未审批卡片、已有排队项、或队列暂停时，回车直接入队
+    return (
+      isGenerating() ||
+      hasPendingConfirmationCard() ||
+      queue.length > 0 ||
+      queuePaused
+    );
+  }
+
+  function interceptEditorSubmit(event, forceQueue) {
+    if (!shouldInterceptForQueue(forceQueue)) {
+      return false;
+    }
+    const editor = getEditor();
+    if (!editor) {
+      return false;
+    }
+    const text = getEditorRawText(editor);
+    if (!text) {
+      return false;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') {
+      event.stopImmediatePropagation();
+    }
+
+    clearEditor(editor);
+    enqueuePrompt(text);
+    console.info(`[Gemini Auto Allow] 已加入发送队列（当前共 ${queue.length} 条）`);
+    return true;
+  }
+
+  function setupQueueInputInterception() {
+    // 捕获阶段拦截回车
+    document.addEventListener(
+      'keydown',
+      (e) => {
+        if (e.isComposing || e.keyCode === 229) {
+          return;
+        }
+        if (e.key !== 'Enter') {
+          return;
+        }
+        const editor = getEditor();
+        if (!editor) {
+          return;
+        }
+        const target = e.target;
+        if (!target || (target !== editor && !editor.contains(target))) {
+          return;
+        }
+        // Shift+Enter 保留原生换行
+        if (e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+          return;
+        }
+        // Alt+Enter：无论空闲与否强制入队
+        const forceQueue = Boolean(e.altKey && !e.shiftKey && !e.ctrlKey && !e.metaKey);
+        if (forceQueue || (!e.ctrlKey && !e.metaKey && !e.altKey)) {
+          interceptEditorSubmit(e, forceQueue);
+        }
+      },
+      true
+    );
+
+    // 捕获阶段拦截点击发送按钮（防止生成中/有队列时原生误吞或插队）
+    document.addEventListener(
+      'click',
+      (e) => {
+        if (isScriptSubmitting || !e.isTrusted) {
+          return;
+        }
+        const sendBtn = getSendButton();
+        if (!sendBtn) {
+          return;
+        }
+        if (e.target === sendBtn || sendBtn.contains(e.target)) {
+          interceptEditorSubmit(e, false);
+        }
+      },
+      true
+    );
+  }
+
+  function dispatchNextQueueBatchNow(ignorePaused) {
+    if (queue.length === 0 || isScriptSubmitting) {
+      return false;
+    }
+    if (!ignorePaused && queuePaused) {
+      return false;
+    }
+    if (isGenerating() || hasPendingConfirmationCard()) {
+      return false;
+    }
+    const editor = getEditor();
+    if (!editor || getEditorRawText(editor).length > 0) {
+      // 用户正在输入框里打字，等用户打完/入队后再发
+      return false;
+    }
+
+    const batch = getNextDispatchBatch(queue);
+    if (!batch) {
+      return false;
+    }
+
+    // 正在编辑该批次内条目时不自动发出
+    if (editingItemId && batch.items.some((it) => it.id === editingItemId)) {
+      return false;
+    }
+
+    const batchIds = new Set(batch.items.map((it) => it.id));
+    console.info(
+      `[Gemini Auto Allow] 正在派发队列消息（合并 ${batch.count} 条，剩余 ${queue.length - batch.count} 条）`
+    );
+
+    return fillAndSubmitPrompt(batch.combinedText, (ok) => {
+      if (ok) {
+        queue = queue.filter((it) => !batchIds.has(it.id));
+        saveQueueForCurrentChat();
+        consecutiveContinues = 0; // 新任务发出，重置自动继续计数
+        renderQueueDock();
+        markInjected();
+      } else {
+        console.warn('[Gemini Auto Allow] 队列派发未成功，已保留在队列中等待重试');
+        renderQueueDock();
+      }
+    });
+  }
+
+  function checkQueueDispatch() {
+    if (!settings.queueEnabled || queuePaused || queue.length === 0 || isScriptSubmitting) {
+      if (queueDispatchTimer) {
+        clearTimeout(queueDispatchTimer);
+        queueDispatchTimer = null;
+      }
+      return;
+    }
+
+    if (isGenerating() || hasPendingConfirmationCard()) {
+      if (queueDispatchTimer) {
+        clearTimeout(queueDispatchTimer);
+        queueDispatchTimer = null;
+      }
+      return;
+    }
+
+    // 刚派发完给 Gemini 一段缓冲期，避免在 Stop 按钮出现前连续连发两条
+    const sinceLastDispatch = Date.now() - lastDispatchAt;
+    if (sinceLastDispatch < POST_DISPATCH_COOLDOWN_MS) {
+      if (!queueDispatchTimer) {
+        queueDispatchTimer = window.setTimeout(() => {
+          queueDispatchTimer = null;
+          checkQueueDispatch();
+        }, POST_DISPATCH_COOLDOWN_MS - sinceLastDispatch + 100);
+      }
+      return;
+    }
+
+    if (queueDispatchTimer) {
+      return;
+    }
+
+    const waitMs = document.hidden ? 200 : QUEUE_DISPATCH_STABLE_MS;
+    queueDispatchTimer = window.setTimeout(() => {
+      queueDispatchTimer = null;
+      dispatchNextQueueBatchNow(false);
+    }, waitMs);
+  }
+
+  // ==================== 模块 3：自动回复“继续” ====================
+  function getLastModelResponseInfo() {
+    const responses = [...document.querySelectorAll('model-response')];
+    if (responses.length === 0) {
+      return null;
+    }
+    const last = responses[responses.length - 1];
+    if (last.querySelector(PRIMARY_CARD_SELECTOR) && hasPendingConfirmationCard()) {
+      return null;
+    }
+    const contentEl = last.querySelector('message-content') || last;
+    const fullText = normalizeText(contentEl);
+    if (!fullText) {
+      return null;
+    }
+    const tail = fullText.slice(-800);
+    const key = `${responses.length}:${fullText.length}:${tail.slice(-80)}`;
+    return { key, tail };
+  }
+
+  function matchesContinueTail(tail) {
+    const sentences = tail
+      .split(/[\n。！？!?；;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    return sentences.some((sentence) => {
+      if (CONTINUE_NEGATIVE_PATTERN.test(sentence)) {
+        return false;
+      }
+      return CONTINUE_SENTENCE_RULES.some(
+        (rule) => rule.a.test(sentence) && rule.b.test(sentence)
+      );
+    });
+  }
+
+  function checkAutoContinue() {
+    // 队列里有待发消息时，优先发队列，不插队回复“继续”
+    if (
+      !settings.autoContinue ||
+      queue.length > 0 ||
+      isScriptSubmitting ||
+      consecutiveContinues >= MAX_CONSECUTIVE_CONTINUES
+    ) {
+      if (pendingContinueTimer) {
+        clearTimeout(pendingContinueTimer);
+        pendingContinueTimer = null;
+      }
+      return;
+    }
+
+    if (isGenerating() || hasPendingConfirmationCard()) {
+      if (pendingContinueTimer) {
+        clearTimeout(pendingContinueTimer);
+        pendingContinueTimer = null;
+      }
+      return;
+    }
+
+    if (Date.now() - lastDispatchAt < POST_DISPATCH_COOLDOWN_MS) {
+      return;
+    }
+
+    const info = getLastModelResponseInfo();
+    if (!info || info.key === lastHandledResponseKey) {
+      return;
+    }
+
+    if (!matchesContinueTail(info.tail)) {
+      return;
+    }
+
+    if (pendingContinueCandidateKey === info.key && pendingContinueTimer) {
+      return;
+    }
+
+    if (pendingContinueTimer) {
+      clearTimeout(pendingContinueTimer);
+    }
+    pendingContinueCandidateKey = info.key;
+
+    const executeContinue = () => {
+      pendingContinueTimer = null;
+      if (
+        !settings.autoContinue ||
+        queue.length > 0 ||
+        isScriptSubmitting ||
+        isGenerating() ||
+        hasPendingConfirmationCard()
+      ) {
+        return;
+      }
+      const latest = getLastModelResponseInfo();
+      if (!latest || latest.key !== info.key || latest.key === lastHandledResponseKey) {
+        return;
+      }
+      fillAndSubmitPrompt(CONTINUE_TEXT, (ok) => {
+        if (ok) {
+          lastHandledResponseKey = latest.key;
+          consecutiveContinues += 1;
+          markInjected();
+          console.info(
+            `[Gemini Auto Allow] 检测到继续提示，已自动回复「${CONTINUE_TEXT}」（${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES}）`
+          );
+        }
+      });
+    };
+
+    if (document.hidden) {
+      executeContinue();
+    } else {
+      pendingContinueTimer = window.setTimeout(executeContinue, CONTINUE_STABLE_MS);
+    }
+  }
+
+  // ==================== 模块 4：SPA 路由监听与状态重置 ====================
+  function onRouteChange() {
+    const nextPath = location.pathname;
+    if (nextPath === currentPath) {
+      return;
+    }
+    currentPath = nextPath;
+    consecutiveContinues = 0;
+    lastHandledResponseKey = '';
+    pendingContinueCandidateKey = '';
+    editingItemId = null;
+    if (pendingContinueTimer) {
+      clearTimeout(pendingContinueTimer);
+      pendingContinueTimer = null;
+    }
+    if (queueDispatchTimer) {
+      clearTimeout(queueDispatchTimer);
+      queueDispatchTimer = null;
+    }
+    loadQueueForCurrentChat();
+    renderQueueDock();
+    markInjected();
+    console.info(`[Gemini Auto Allow] 检测到切换会话 (${currentPath})，已重置自动继续计数并加载对应队列（${queue.length} 条）`);
+  }
+
+  function installRouteWatcher() {
+    const origPush = history.pushState;
+    const origReplace = history.replaceState;
+    history.pushState = function (...args) {
+      const ret = origPush.apply(this, args);
+      onRouteChange();
+      return ret;
+    };
+    history.replaceState = function (...args) {
+      const ret = origReplace.apply(this, args);
+      onRouteChange();
+      return ret;
+    };
+    window.addEventListener('popstate', onRouteChange);
+  }
+
+  // ==================== 模块 5：多标签 BroadcastChannel 总览 ====================
+  function getCurrentTabState() {
+    if (hasPendingConfirmationCard()) return 'approval';
+    if (isGenerating()) return 'generating';
+    if (queue.length > 0) return 'queued';
+    return 'idle';
+  }
+
+  function cleanTitle(raw) {
+    return (raw || 'Gemini')
+      .replace(/^\[(?:⏳审批|⚡运行|📋排队\d+|⏸暂停\d+)\]\s*/, '')
+      .trim();
+  }
+
+  function updateTabTitle() {
+    const currentClean = cleanTitle(document.title);
+    if (currentClean) {
+      basePageTitle = currentClean;
+    }
+    if (!settings.titleStatusEnabled) {
+      if (document.title !== basePageTitle) {
+        document.title = basePageTitle;
+      }
+      return;
+    }
+    const state = getCurrentTabState();
+    let prefix = '';
+    if (state === 'approval') {
+      prefix = '[⏳审批] ';
+    } else if (queuePaused && queue.length > 0) {
+      prefix = `[⏸暂停${queue.length}] `;
+    } else if (queue.length > 0) {
+      prefix = `[📋排队${queue.length}] `;
+    } else if (state === 'generating') {
+      prefix = '[⚡运行] ';
+    }
+    const targetTitle = prefix + basePageTitle;
+    if (document.title !== targetTitle) {
+      document.title = targetTitle;
+    }
+  }
+
+  function broadcastTabState() {
+    if (!tabChannel) {
+      return;
+    }
+    try {
+      tabChannel.postMessage({
+        type: 'heartbeat',
+        tabId: TAB_ID,
+        title: basePageTitle,
+        path: currentPath,
+        state: getCurrentTabState(),
+        queueCount: queue.length,
+        paused: queuePaused,
+        clickCount,
+        hidden: document.hidden,
+        ts: Date.now(),
+      });
+    } catch (_) {
+      // 忽略通道关闭异常
+    }
+  }
+
+  function initTabChannel() {
+    if (typeof BroadcastChannel !== 'function') {
+      return;
+    }
+    try {
+      tabChannel = new BroadcastChannel(TAB_CHANNEL_NAME);
+      tabChannel.onmessage = (ev) => {
+        const data = ev.data;
+        if (!data || !data.tabId || data.tabId === TAB_ID) {
+          return;
+        }
+        if (data.type === 'bye') {
+          peerTabs.delete(data.tabId);
+        } else if (data.type === 'heartbeat') {
+          peerTabs.set(data.tabId, data);
+        }
+        updateBadge();
+        if (popoverOpen) {
+          renderPopover();
+        }
+      };
+      window.addEventListener('beforeunload', () => {
+        try {
+          tabChannel.postMessage({ type: 'bye', tabId: TAB_ID });
+        } catch (_) {}
+      });
+    } catch (_) {
+      tabChannel = null;
+    }
+  }
+
+  function getActivePeerTabs() {
+    const now = Date.now();
+    const list = [];
+    for (const [id, info] of peerTabs.entries()) {
+      if (now - info.ts > 60000) {
+        peerTabs.delete(id);
+        continue;
+      }
+      list.push({
+        ...info,
+        maybeFrozen: now - info.ts > 12000,
+      });
+    }
+    return list;
+  }
+
+  // ==================== 模块 6：UI（输入框上方队列面板 + 右下角控制台） ====================
+  function ensureStyles() {
+    if (document.getElementById('gemini-aa-style')) {
+      return;
+    }
+    const style = document.createElement('style');
+    style.id = 'gemini-aa-style';
+    style.textContent = `
+      #gemini-aa-root {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #e8eaed;
+      }
+      #gemini-aa-badge {
+        position: fixed;
+        right: 14px;
+        bottom: 12px;
+        z-index: 99999;
+        padding: 5px 11px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.16);
+        background: rgba(24, 25, 29, 0.86);
+        color: #e8eaed;
+        font-size: 11px;
+        line-height: 16px;
+        cursor: pointer;
+        backdrop-filter: blur(8px);
+        box-shadow: 0 4px 14px rgba(0,0,0,0.28);
+        opacity: 0.82;
+        transition: opacity 0.15s ease, border-color 0.15s ease;
+      }
+      #gemini-aa-badge:hover { opacity: 1; border-color: rgba(138, 180, 248, 0.6); }
+      #gemini-aa-popover {
+        position: fixed;
+        right: 14px;
+        bottom: 46px;
+        z-index: 99999;
+        width: 300px;
+        max-height: 70vh;
+        overflow-y: auto;
+        border-radius: 12px;
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(24, 25, 30, 0.96);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+        backdrop-filter: blur(12px);
+        padding: 12px;
+        font-size: 12px;
+        display: none;
+      }
+      #gemini-aa-popover.open { display: block; }
+      .gaa-section-title {
+        font-size: 11px;
+        font-weight: 600;
+        color: #9aa0a6;
+        margin: 8px 0 6px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .gaa-section-title:first-child { margin-top: 0; }
+      .gaa-toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 5px 0;
+        gap: 8px;
+      }
+      .gaa-switch {
+        padding: 2px 9px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(255,255,255,0.06);
+        color: #bdc1c6;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .gaa-switch.on {
+        background: rgba(138, 180, 248, 0.22);
+        border-color: rgba(138, 180, 248, 0.65);
+        color: #8ab4f8;
+      }
+      .gaa-tab-row {
+        padding: 5px 7px;
+        border-radius: 7px;
+        background: rgba(255,255,255,0.04);
+        margin-bottom: 5px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 6px;
+      }
+      .gaa-tab-name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 175px;
+        color: #e8eaed;
+      }
+      .gaa-pill {
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        white-space: nowrap;
+      }
+      .gaa-pill.approval { background: rgba(242,139,130,0.22); color: #f28b82; }
+      .gaa-pill.generating { background: rgba(138,180,248,0.22); color: #8ab4f8; }
+      .gaa-pill.queued { background: rgba(253,214,99,0.2); color: #fdd663; }
+      .gaa-pill.idle { background: rgba(129,201,149,0.18); color: #81c995; }
+      .gaa-pill.frozen { background: rgba(154,160,166,0.22); color: #9aa0a6; }
+
+      /* 输入框正上方的排队浮层 */
+      #gemini-aa-queue-dock {
+        position: fixed;
+        z-index: 99990;
+        left: 50%;
+        transform: translateX(-50%);
+        bottom: 122px;
+        width: min(740px, calc(100vw - 48px));
+        border-radius: 14px;
+        border: 1px solid rgba(138, 180, 248, 0.28);
+        background: rgba(24, 26, 32, 0.94);
+        backdrop-filter: blur(12px);
+        box-shadow: 0 8px 28px rgba(0,0,0,0.38);
+        padding: 8px 10px;
+        font-size: 12px;
+        display: none;
+      }
+      #gemini-aa-queue-dock.visible { display: block; }
+      #gemini-aa-queue-dock.hint-only {
+        padding: 4px 12px;
+        border-color: rgba(255,255,255,0.12);
+        background: rgba(24, 26, 32, 0.78);
+        width: auto;
+        max-width: min(680px, calc(100vw - 48px));
+      }
+      .gaa-q-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 6px;
+        flex-wrap: wrap;
+      }
+      .gaa-q-title {
+        font-weight: 600;
+        color: #e8eaed;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .gaa-q-actions {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        flex-wrap: wrap;
+      }
+      .gaa-btn {
+        border: 1px solid rgba(255,255,255,0.16);
+        background: rgba(255,255,255,0.06);
+        color: #e8eaed;
+        border-radius: 7px;
+        padding: 2px 8px;
+        font-size: 11px;
+        line-height: 18px;
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease;
+      }
+      .gaa-btn:hover { background: rgba(255,255,255,0.14); }
+      .gaa-btn.active {
+        background: rgba(138, 180, 248, 0.22);
+        border-color: rgba(138, 180, 248, 0.6);
+        color: #8ab4f8;
+      }
+      .gaa-btn.warn {
+        background: rgba(253, 214, 99, 0.18);
+        border-color: rgba(253, 214, 99, 0.55);
+        color: #fdd663;
+      }
+      .gaa-btn.danger:hover {
+        background: rgba(242, 139, 130, 0.22);
+        border-color: rgba(242, 139, 130, 0.6);
+        color: #f28b82;
+      }
+      .gaa-q-list {
+        max-height: 220px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .gaa-q-item {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 6px 8px;
+        border-radius: 9px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.08);
+      }
+      .gaa-q-item.merged {
+        margin-top: -2px;
+        margin-left: 16px;
+        border-left: 2px solid #8ab4f8;
+        background: rgba(138, 180, 248, 0.08);
+      }
+      .gaa-q-left {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+      }
+      .gaa-q-badge {
+        flex-shrink: 0;
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 5px;
+        background: rgba(255,255,255,0.1);
+        color: #bdc1c6;
+        margin-top: 1px;
+      }
+      .gaa-q-item.merged .gaa-q-badge {
+        background: rgba(138, 180, 248, 0.22);
+        color: #8ab4f8;
+      }
+      .gaa-q-text {
+        flex: 1;
+        min-width: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: #e8eaed;
+        line-height: 1.4;
+        max-height: 60px;
+        overflow-y: auto;
+      }
+      .gaa-q-edit-area {
+        width: 100%;
+        min-height: 44px;
+        border-radius: 6px;
+        border: 1px solid rgba(138, 180, 248, 0.6);
+        background: rgba(16, 17, 22, 0.95);
+        color: #e8eaed;
+        padding: 4px 6px;
+        font-size: 12px;
+        font-family: inherit;
+        resize: vertical;
+      }
+      .gaa-q-item-ops {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .gaa-icon-btn {
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(255,255,255,0.05);
+        color: #bdc1c6;
+        border-radius: 6px;
+        padding: 1px 6px;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .gaa-icon-btn:hover { background: rgba(255,255,255,0.14); color: #fff; }
+      .gaa-icon-btn.merged-on {
+        background: rgba(138, 180, 248, 0.24);
+        border-color: rgba(138, 180, 248, 0.6);
+        color: #8ab4f8;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function ensureUI() {
+    if (!document.body) {
+      return;
+    }
+    ensureStyles();
+    if (!uiRoot || !uiRoot.isConnected) {
+      uiRoot = document.createElement('div');
+      uiRoot.id = 'gemini-aa-root';
+
+      queueDockEl = document.createElement('div');
+      queueDockEl.id = 'gemini-aa-queue-dock';
+
+      popoverEl = document.createElement('div');
+      popoverEl.id = 'gemini-aa-popover';
+
+      badgeBtn = document.createElement('button');
+      badgeBtn.type = 'button';
+      badgeBtn.id = 'gemini-aa-badge';
+      badgeBtn.title = '点击打开设置与多标签状态总览';
+      badgeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        popoverOpen = !popoverOpen;
+        popoverEl.classList.toggle('open', popoverOpen);
+        if (popoverOpen) {
+          renderPopover();
+        }
+      });
+
+      uiRoot.appendChild(queueDockEl);
+      uiRoot.appendChild(popoverEl);
+      uiRoot.appendChild(badgeBtn);
+      document.body.appendChild(uiRoot);
+    }
+  }
+
+  function positionQueueDock() {
+    if (!queueDockEl || !queueDockEl.classList.contains('visible')) {
+      return;
+    }
+    const anchor =
+      document.querySelector('input-area-v2, .input-area-container, rich-textarea') ||
+      getEditor();
+    if (anchor) {
+      const rect = anchor.getBoundingClientRect();
+      if (rect.width > 120 && rect.top > 80 && rect.top < window.innerHeight) {
+        const bottomPx = Math.max(84, Math.round(window.innerHeight - rect.top + 10));
+        const centerX = Math.round(rect.left + rect.width / 2);
+        queueDockEl.style.bottom = `${bottomPx}px`;
+        queueDockEl.style.left = `${centerX}px`;
+        if (!queueDockEl.classList.contains('hint-only')) {
+          const targetWidth = Math.min(760, Math.max(360, Math.round(rect.width)));
+          queueDockEl.style.width = `${targetWidth}px`;
+        } else {
+          queueDockEl.style.width = 'auto';
+        }
+        return;
+      }
+    }
+    queueDockEl.style.bottom = '122px';
+    queueDockEl.style.left = '50%';
+  }
+
+  function renderQueueDock(force) {
+    ensureUI();
+    if (!queueDockEl) {
+      return;
+    }
+
+    const generating = isGenerating();
+    const pendingCard = hasPendingConfirmationCard();
+
+    // 正在编辑某条内容且非主动重绘时，不破坏当前输入框焦点
+    if (!force && editingItemId) {
+      positionQueueDock();
+      return;
+    }
+
+    const renderKey = [
+      settings.queueEnabled,
+      settings.queueMergeByDefault,
+      queuePaused,
+      editingItemId || '',
+      generating,
+      pendingCard,
+      queue.map((it) => `${it.id}:${it.mergeWithPrev ? 1 : 0}:${it.text}`).join('|'),
+    ].join('::');
+
+    if (!force && renderKey === lastQueueRenderKey) {
+      positionQueueDock();
+      return;
+    }
+    lastQueueRenderKey = renderKey;
+
+    if (!settings.queueEnabled) {
+      queueDockEl.classList.remove('visible', 'hint-only');
+      return;
+    }
+
+    // 队列为空时：仅在模型生成中显示一行轻提示，空闲时彻底隐藏
+    if (queue.length === 0) {
+      if (generating) {
+        queueDockEl.className = 'visible hint-only';
+        const span = document.createElement('span');
+        span.style.color = '#bdc1c6';
+        span.textContent = `📋 回复生成中：直接打字按回车即可加入上方排队（新条默认：${settings.queueMergeByDefault ? '并入上条' : '逐条独立发'}）`;
+        queueDockEl.replaceChildren(span);
+        positionQueueDock();
+      } else {
+        queueDockEl.className = '';
+      }
+      return;
+    }
+
+    queueDockEl.className = 'visible';
+    queueDockEl.replaceChildren();
+
+    // 计算当前共几轮（合并组算同一轮）
+    let batchCount = 0;
+    queue.forEach((item, idx) => {
+      if (idx === 0 || !item.mergeWithPrev) {
+        batchCount += 1;
+      }
+    });
+
+    // Header
+    const header = document.createElement('div');
+    header.className = 'gaa-q-header';
+
+    const title = document.createElement('div');
+    title.className = 'gaa-q-title';
+    title.textContent = `📋 待发队列（${queue.length} 条 → 分 ${batchCount} 轮发送）`;
+    if (queuePaused) {
+      const pTag = document.createElement('span');
+      pTag.className = 'gaa-pill queued';
+      pTag.textContent = '已暂停';
+      title.appendChild(pTag);
+    } else if (isGenerating()) {
+      const gTag = document.createElement('span');
+      gTag.className = 'gaa-pill generating';
+      gTag.textContent = '等待本轮回复结束';
+      title.appendChild(gTag);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'gaa-q-actions';
+
+    // 默认合并模式切换按钮
+    const modeBtn = document.createElement('button');
+    modeBtn.type = 'button';
+    modeBtn.className = `gaa-btn ${settings.queueMergeByDefault ? 'active' : ''}`;
+    modeBtn.title = '切换新回车消息的默认行为：并入上一条合并发送 / 独立作为下一轮发送';
+    modeBtn.textContent = settings.queueMergeByDefault ? '新条默认: 🔗合并上条' : '新条默认: ✂️逐条发';
+    modeBtn.addEventListener('click', () => {
+      settings.queueMergeByDefault = !settings.queueMergeByDefault;
+      saveSettings();
+      renderQueueDock();
+      if (popoverOpen) renderPopover();
+    });
+    actions.appendChild(modeBtn);
+
+    // 暂停/继续派发
+    const pauseBtn = document.createElement('button');
+    pauseBtn.type = 'button';
+    pauseBtn.className = `gaa-btn ${queuePaused ? 'warn' : ''}`;
+    pauseBtn.textContent = queuePaused ? '▶ 继续派发' : '⏸ 暂停';
+    pauseBtn.addEventListener('click', () => {
+      queuePaused = !queuePaused;
+      renderQueueDock();
+      markInjected();
+      if (!queuePaused) {
+        scheduleScan();
+      }
+    });
+    actions.appendChild(pauseBtn);
+
+    // 若空闲，允许立即发下一轮
+    if (!isGenerating() && !hasPendingConfirmationCard()) {
+      const sendNowBtn = document.createElement('button');
+      sendNowBtn.type = 'button';
+      sendNowBtn.className = 'gaa-btn active';
+      sendNowBtn.textContent = '⚡ 立即发下轮';
+      sendNowBtn.addEventListener('click', () => {
+        dispatchNextQueueBatchNow(true);
+      });
+      actions.appendChild(sendNowBtn);
+    }
+
+    // 清空队列
+    const clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'gaa-btn danger';
+    clearBtn.textContent = '清空';
+    clearBtn.addEventListener('click', () => {
+      queue = [];
+      editingItemId = null;
+      saveQueueForCurrentChat();
+      renderQueueDock();
+      markInjected();
+    });
+    actions.appendChild(clearBtn);
+
+    header.appendChild(title);
+    header.appendChild(actions);
+    queueDockEl.appendChild(header);
+
+    // 列表
+    const listEl = document.createElement('div');
+    listEl.className = 'gaa-q-list';
+
+    let roundIdx = 0;
+    queue.forEach((item, idx) => {
+      const isMerged = idx > 0 && item.mergeWithPrev;
+      if (!isMerged) {
+        roundIdx += 1;
+      }
+
+      const row = document.createElement('div');
+      row.className = `gaa-q-item ${isMerged ? 'merged' : ''}`;
+
+      const left = document.createElement('div');
+      left.className = 'gaa-q-left';
+
+      const badge = document.createElement('span');
+      badge.className = 'gaa-q-badge';
+      badge.textContent = isMerged ? `↳ 并入第${roundIdx}轮` : `第${roundIdx}轮`;
+      left.appendChild(badge);
+
+      if (editingItemId === item.id) {
+        const ta = document.createElement('textarea');
+        ta.className = 'gaa-q-edit-area';
+        ta.value = item.text;
+        ta.addEventListener('keydown', (e) => {
+          e.stopPropagation();
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+            item.text = ta.value.trim() || item.text;
+            editingItemId = null;
+            saveQueueForCurrentChat();
+            renderQueueDock(true);
+          } else if (e.key === 'Escape') {
+            editingItemId = null;
+            renderQueueDock(true);
+          }
+        });
+        left.appendChild(ta);
+
+        const ops = document.createElement('div');
+        ops.className = 'gaa-q-item-ops';
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.className = 'gaa-icon-btn merged-on';
+        saveBtn.textContent = '保存';
+        saveBtn.addEventListener('click', () => {
+          item.text = ta.value.trim() || item.text;
+          editingItemId = null;
+          saveQueueForCurrentChat();
+          renderQueueDock(true);
+        });
+        ops.appendChild(saveBtn);
+        row.appendChild(left);
+        row.appendChild(ops);
+      } else {
+        const txt = document.createElement('div');
+        txt.className = 'gaa-q-text';
+        txt.textContent = item.text;
+        txt.title = '双击编辑';
+        txt.addEventListener('dblclick', () => {
+          editingItemId = item.id;
+          renderQueueDock(true);
+        });
+        left.appendChild(txt);
+
+        const ops = document.createElement('div');
+        ops.className = 'gaa-q-item-ops';
+
+        // 单条切换：与上条合并 vs 独立发（第 1 条除外）
+        if (idx > 0) {
+          const mergeToggle = document.createElement('button');
+          mergeToggle.type = 'button';
+          mergeToggle.className = `gaa-icon-btn ${item.mergeWithPrev ? 'merged-on' : ''}`;
+          mergeToggle.title = item.mergeWithPrev
+            ? '当前会与上一条合并成同一轮发送，点击改为单独发'
+            : '当前会单独作为下一轮发送，点击改为并入上一条';
+          mergeToggle.textContent = item.mergeWithPrev ? '🔗 合并' : '✂️ 独立';
+          mergeToggle.addEventListener('click', () => {
+            item.mergeWithPrev = !item.mergeWithPrev;
+            saveQueueForCurrentChat();
+            renderQueueDock();
+          });
+          ops.appendChild(mergeToggle);
+        }
+
+        // 上移
+        if (idx > 0) {
+          const upBtn = document.createElement('button');
+          upBtn.type = 'button';
+          upBtn.className = 'gaa-icon-btn';
+          upBtn.title = '上移';
+          upBtn.textContent = '↑';
+          upBtn.addEventListener('click', () => {
+            [queue[idx - 1], queue[idx]] = [queue[idx], queue[idx - 1]];
+            saveQueueForCurrentChat();
+            renderQueueDock();
+          });
+          ops.appendChild(upBtn);
+        }
+
+        // 编辑
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'gaa-icon-btn';
+        editBtn.title = '编辑内容';
+        editBtn.textContent = '✎';
+        editBtn.addEventListener('click', () => {
+          editingItemId = item.id;
+          renderQueueDock(true);
+        });
+        ops.appendChild(editBtn);
+
+        // 删除
+        const delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'gaa-icon-btn';
+        delBtn.title = '删除此条';
+        delBtn.textContent = '×';
+        delBtn.addEventListener('click', () => {
+          queue.splice(idx, 1);
+          saveQueueForCurrentChat();
+          renderQueueDock();
+          markInjected();
+        });
+        ops.appendChild(delBtn);
+
+        row.appendChild(left);
+        row.appendChild(ops);
+      }
+
+      listEl.appendChild(row);
+    });
+
+    queueDockEl.appendChild(listEl);
+    positionQueueDock();
+  }
+
+  function renderPopover() {
+    if (!popoverEl) {
+      return;
+    }
+    popoverEl.replaceChildren();
+
+    const title = document.createElement('div');
+    title.className = 'gaa-section-title';
+    const titleLeft = document.createElement('span');
+    titleLeft.textContent = `Gemini 自动助手 v${SCRIPT_VERSION}`;
+    const titleRight = document.createElement('span');
+    titleRight.textContent = 'Alt+Enter 强制入队';
+    title.append(titleLeft, titleRight);
+    popoverEl.appendChild(title);
+
+    const toggles = [
+      {
+        label: '自动审批权限卡片',
+        key: 'autoApprove',
+      },
+      {
+        label: '无“始终允许”时回退“允许”',
+        key: 'fallbackToChatOrOnce',
+      },
+      {
+        label: '回车消息排队（Prompt Queue）',
+        key: 'queueEnabled',
+      },
+      {
+        label: '排队新条默认并入上一条',
+        key: 'queueMergeByDefault',
+      },
+      {
+        label: `自动回复「继续」(${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES})`,
+        key: 'autoContinue',
+      },
+      {
+        label: '标签页标题显示运行状态',
+        key: 'titleStatusEnabled',
+      },
+    ];
+
+    for (const item of toggles) {
+      const row = document.createElement('div');
+      row.className = 'gaa-toggle-row';
+      const lbl = document.createElement('span');
+      lbl.textContent = item.label;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      const isOn = Boolean(settings[item.key]);
+      btn.className = `gaa-switch ${isOn ? 'on' : ''}`;
+      btn.textContent = isOn ? '已开启' : '已关闭';
+      btn.addEventListener('click', () => {
+        settings[item.key] = !settings[item.key];
+        if (item.key === 'autoContinue' && settings.autoContinue) {
+          consecutiveContinues = 0;
+        }
+        saveSettings();
+        renderQueueDock();
+        markInjected();
+        renderPopover();
+        scheduleScan();
+      });
+      row.appendChild(lbl);
+      row.appendChild(btn);
+      popoverEl.appendChild(row);
+    }
+
+    // 多标签总览
+    const peers = getActivePeerTabs();
+    const tabHeader = document.createElement('div');
+    tabHeader.className = 'gaa-section-title';
+    const tabHeaderSpan = document.createElement('span');
+    tabHeaderSpan.textContent = `多标签状态总览（共 ${peers.length + 1} 个）`;
+    tabHeader.appendChild(tabHeaderSpan);
+    popoverEl.appendChild(tabHeader);
+
+    const stateLabelMap = {
+      approval: ['卡审批', 'approval'],
+      generating: ['运行中', 'generating'],
+      queued: ['排队中', 'queued'],
+      idle: ['空闲', 'idle'],
+    };
+
+    const allTabs = [
+      {
+        title: `${basePageTitle}（当前）`,
+        state: getCurrentTabState(),
+        queueCount: queue.length,
+        maybeFrozen: false,
+      },
+      ...peers,
+    ];
+
+    for (const t of allTabs) {
+      const row = document.createElement('div');
+      row.className = 'gaa-tab-row';
+      const name = document.createElement('span');
+      name.className = 'gaa-tab-name';
+      name.textContent = t.title || t.path || 'Gemini';
+      name.title = t.title || t.path || 'Gemini';
+
+      const pill = document.createElement('span');
+      if (t.maybeFrozen) {
+        pill.className = 'gaa-pill frozen';
+        pill.textContent = '可能已冻结';
+      } else {
+        const [label, cls] = stateLabelMap[t.state] || ['空闲', 'idle'];
+        pill.className = `gaa-pill ${cls}`;
+        pill.textContent = t.queueCount > 0 ? `${label}·队${t.queueCount}` : label;
+      }
+      row.appendChild(name);
+      row.appendChild(pill);
+      popoverEl.appendChild(row);
+    }
+  }
+
+  function updateBadge() {
+    ensureUI();
+    if (!badgeBtn) {
+      return;
+    }
+    const peers = getActivePeerTabs();
+    const approvalPeers = peers.filter((p) => p.state === 'approval').length;
+    const parts = [
+      `审批:${settings.autoApprove ? clickCount : '关'}`,
+      `排队:${settings.queueEnabled ? queue.length : '关'}`,
+      `续:${settings.autoContinue ? `${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES}` : '关'}`,
+    ];
+    if (peers.length > 0) {
+      parts.push(
+        approvalPeers > 0
+          ? `标签:${peers.length + 1}(⚠️${approvalPeers})`
+          : `标签:${peers.length + 1}`
+      );
+    }
+    const nextText = parts.join(' | ');
+    if (badgeBtn.textContent !== nextText) {
+      badgeBtn.textContent = nextText;
+    }
+  }
+
+  function markInjected() {
+    if (document.documentElement) {
+      document.documentElement.dataset.geminiAutoAllow = SCRIPT_VERSION;
+      document.documentElement.dataset.geminiAutoAllowClicks = String(clickCount);
+      document.documentElement.dataset.geminiAutoContinue = String(settings.autoContinue);
+      document.documentElement.dataset.geminiQueueLength = String(queue.length);
+    }
+    updateBadge();
+    updateTabTitle();
+    broadcastTabState();
+  }
+
+  // ==================== 主扫描循环 ====================
   function scan() {
     scanScheduled = false;
-    document.querySelectorAll(CARD_SELECTOR).forEach(handleCard);
+    onRouteChange();
+    collectConfirmationContainers().forEach(handleCard);
     flushStuckApprovalInput();
+    checkQueueDispatch();
     checkAutoContinue();
+    renderQueueDock();
+    updateBadge();
+    updateTabTitle();
   }
 
   function scheduleScan() {
@@ -561,35 +1940,59 @@
     queueMicrotask(scan);
   }
 
-  // 使用轻量内联 Web Worker 减轻后台普通节流（若浏览器彻底冻结标签页，则依赖 resume 事件恢复）
   function startBackgroundHeartbeat() {
     let fallbackTimer = null;
     const startFallback = () => {
       if (!fallbackTimer) {
-        fallbackTimer = window.setInterval(scan, FALLBACK_POLL_MS);
+        fallbackTimer = window.setInterval(() => {
+          scan();
+          broadcastTabState();
+        }, FALLBACK_POLL_MS);
       }
     };
     try {
       const workerCode = `setInterval(() => postMessage('tick'), ${FALLBACK_POLL_MS});`;
       const blob = new Blob([workerCode], { type: 'application/javascript' });
       const worker = new Worker(URL.createObjectURL(blob));
-      worker.onmessage = scan;
+      worker.onmessage = () => {
+        scan();
+        broadcastTabState();
+      };
       worker.onerror = startFallback;
     } catch (_) {
       startFallback();
     }
   }
 
+  // ==================== 启动入口 ====================
+  loadQueueForCurrentChat();
+  installRouteWatcher();
+  setupQueueInputInterception();
+  initTabChannel();
   markInjected();
-  console.info(`[Gemini Auto Allow] v${SCRIPT_VERSION} 已启动`);
 
-  const observer = new MutationObserver(scheduleScan);
+  document.addEventListener('click', (e) => {
+    if (popoverOpen && popoverEl && badgeBtn && !popoverEl.contains(e.target) && !badgeBtn.contains(e.target)) {
+      popoverOpen = false;
+      popoverEl.classList.remove('open');
+    }
+  });
+  window.addEventListener('resize', positionQueueDock);
+
+  const observer = new MutationObserver((mutations) => {
+    const hasExternalMutation = mutations.some(
+      (m) => !uiRoot || !uiRoot.contains(m.target)
+    );
+    if (hasExternalMutation) {
+      scheduleScan();
+    }
+  });
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
     characterData: true,
     attributes: true,
-    attributeFilter: ['disabled', 'aria-disabled', 'inert', 'class', 'style'],
+    attributeFilter: ['disabled', 'aria-disabled', 'inert', 'class', 'style', 'aria-busy'],
   });
 
   startBackgroundHeartbeat();
@@ -598,4 +2001,6 @@
   window.addEventListener('focus', scan);
   window.addEventListener('pageshow', scan);
   scan();
+
+  console.info(`[Gemini Auto Allow] v${SCRIPT_VERSION} 已启动（自动审批 + 消息排队 + 多标签总览）`);
 })();
