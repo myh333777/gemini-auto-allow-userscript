@@ -5,16 +5,16 @@
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v3.2.1-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v3.2.1"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v3.2.2-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v3.2.2"></a>
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v3.2.1-3776AB?style=flat-square" alt="Version v3.2.1"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v3.2.2-3776AB?style=flat-square" alt="Version v3.2.2"></a>
   <img src="https://img.shields.io/badge/Target-gemini.google.com-4B5563?style=flat-square" alt="Target gemini.google.com">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E?style=flat-square" alt="License: MIT"></a>
 </p>
 
-## 核心功能（v3.2.1）
+## 核心功能（v3.2.2）
 
 1. **全覆盖自动审批**
    - 同时监听 `remy-confirmation-card`、`remy-confirmation-card-v2`、`spark-waiting-for-user-banner` 以及 `[role="dialog"]` / `[role="alertdialog"]`（内置删除对话/清空记录类危险弹窗黑名单防误点）。

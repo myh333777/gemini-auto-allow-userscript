@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Prompt Queue & Multi-Tab)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      3.2.1
-// @description  自动放行 Gemini 工具/任务权限审批卡片；精准监测侧边栏 remy-goal-status-badge 小旗待审批任务并后台自动打开、紧凑窄窗防收缩主题、生成中回车消息排队（逐条/合并混排）、SPA 切会话重置与多标签总览。
+// @version      3.2.2
+// @description  自动放行 Gemini 工具/任务权限审批卡片；精准监测侧边栏 remy-goal-status-badge 小旗待审批任务并后台自动打开、紧凑窄窗防收缩主题、生成中回车消息排队（逐条/合并混排）、可自由拖动浮窗与多标签总览。
 // @author       myh333777
 // @match        https://gemini.google.com/*
 // @homepageURL  https://github.com/myh333777/gemini-auto-allow-userscript
@@ -17,10 +17,11 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '3.2.1';
+  const SCRIPT_VERSION = '3.2.2';
   const STORAGE_SETTINGS_KEY = 'gemini_aa_settings_v3';
   const STORAGE_QUEUE_PREFIX = 'gemini_aa_queue_v3:';
   const STORAGE_OPENED_FLAGS_KEY = 'gemini_aa_opened_flags_v3';
+  const STORAGE_UI_POS_KEY = 'gemini_aa_ui_pos_v3';
   const TAB_CHANNEL_NAME = 'gemini-auto-allow-v3-tabs';
   const TAB_ID = `tab_${Math.random().toString(36).slice(2, 9)}`;
 
@@ -1483,27 +1484,30 @@
       }
       #gemini-aa-badge {
         position: fixed;
-        right: 14px;
-        bottom: 12px;
+        right: 16px;
+        bottom: 118px;
         z-index: 99999;
         padding: 5px 11px;
         border-radius: 999px;
         border: 1px solid rgba(255,255,255,0.16);
-        background: rgba(24, 25, 29, 0.86);
+        background: rgba(24, 25, 29, 0.88);
         color: #e8eaed;
         font-size: 11px;
         line-height: 16px;
-        cursor: pointer;
+        cursor: grab;
+        user-select: none;
+        touch-action: none;
         backdrop-filter: blur(8px);
         box-shadow: 0 4px 14px rgba(0,0,0,0.28);
-        opacity: 0.82;
+        opacity: 0.86;
         transition: opacity 0.15s ease, border-color 0.15s ease;
       }
+      #gemini-aa-badge:active { cursor: grabbing; }
       #gemini-aa-badge:hover { opacity: 1; border-color: rgba(138, 180, 248, 0.6); }
       #gemini-aa-popover {
         position: fixed;
-        right: 14px;
-        bottom: 46px;
+        right: 16px;
+        bottom: 154px;
         z-index: 99999;
         width: 300px;
         max-height: 70vh;
@@ -1610,7 +1614,11 @@
         gap: 8px;
         margin-bottom: 6px;
         flex-wrap: wrap;
+        cursor: grab;
+        user-select: none;
       }
+      .gaa-q-header:active { cursor: grabbing; }
+      #gemini-aa-queue-dock.hint-only { cursor: grab; user-select: none; }
       .gaa-q-title {
         font-weight: 600;
         color: #e8eaed;
@@ -1782,6 +1790,142 @@
     document.head.appendChild(style);
   }
 
+  function loadUiPositions() {
+    try {
+      const raw = localStorage.getItem(STORAGE_UI_POS_KEY);
+      if (raw) {
+        return JSON.parse(raw) || {};
+      }
+    } catch (_) {}
+    return {};
+  }
+
+  function saveUiPosition(key, pos) {
+    try {
+      const all = loadUiPositions();
+      if (pos === null) {
+        delete all[key];
+      } else {
+        all[key] = pos;
+      }
+      localStorage.setItem(STORAGE_UI_POS_KEY, JSON.stringify(all));
+    } catch (_) {}
+  }
+
+  function applySavedFixedPos(el, key) {
+    const pos = loadUiPositions()[key];
+    if (!el || !pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') {
+      return false;
+    }
+    const w = el.offsetWidth || 160;
+    const h = el.offsetHeight || 28;
+    const left = Math.max(8, Math.min(window.innerWidth - w - 8, pos.left));
+    const top = Math.max(8, Math.min(window.innerHeight - h - 8, pos.top));
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
+    el.style.right = 'auto';
+    el.style.bottom = 'auto';
+    el.style.transform = 'none';
+    return true;
+  }
+
+  function positionPopover() {
+    if (!popoverEl || !badgeBtn || !popoverOpen) {
+      return;
+    }
+    const br = badgeBtn.getBoundingClientRect();
+    const popW = 300;
+    const popH = Math.min(popoverEl.offsetHeight || 360, window.innerHeight * 0.7);
+    let left = br.right - popW;
+    left = Math.max(8, Math.min(window.innerWidth - popW - 8, left));
+    let top = br.top - popH - 8;
+    if (top < 8) {
+      top = Math.min(window.innerHeight - popH - 8, br.bottom + 8);
+    }
+    popoverEl.style.left = `${Math.round(left)}px`;
+    popoverEl.style.top = `${Math.round(Math.max(8, top))}px`;
+    popoverEl.style.right = 'auto';
+    popoverEl.style.bottom = 'auto';
+  }
+
+  function makeDraggable(el, storageKey, options = {}) {
+    let startX = 0;
+    let startY = 0;
+    let origLeft = 0;
+    let origTop = 0;
+    let dragging = false;
+    let moved = false;
+
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) {
+        return;
+      }
+      if (options.handleSelector) {
+        const isHandle =
+          e.target.closest(options.handleSelector) ||
+          (options.allowWhenClass && el.classList.contains(options.allowWhenClass));
+        if (!isHandle || e.target.closest('button, textarea, input')) {
+          return;
+        }
+      }
+      const r = el.getBoundingClientRect();
+      startX = e.clientX;
+      startY = e.clientY;
+      origLeft = r.left;
+      origTop = r.top;
+      dragging = true;
+      moved = false;
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch (_) {}
+    });
+
+    el.addEventListener('pointermove', (e) => {
+      if (!dragging) {
+        return;
+      }
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (!moved && Math.hypot(dx, dy) < 5) {
+        return;
+      }
+      moved = true;
+      const w = el.offsetWidth || 160;
+      const h = el.offsetHeight || 28;
+      const left = Math.max(8, Math.min(window.innerWidth - w - 8, origLeft + dx));
+      const top = Math.max(8, Math.min(window.innerHeight - h - 8, origTop + dy));
+      el.style.left = `${Math.round(left)}px`;
+      el.style.top = `${Math.round(top)}px`;
+      el.style.right = 'auto';
+      el.style.bottom = 'auto';
+      el.style.transform = 'none';
+      if (options.onMove) {
+        options.onMove();
+      }
+    });
+
+    const endDrag = (e) => {
+      if (!dragging) {
+        return;
+      }
+      dragging = false;
+      try {
+        el.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+      if (moved) {
+        const r = el.getBoundingClientRect();
+        saveUiPosition(storageKey, { left: Math.round(r.left), top: Math.round(r.top) });
+        el.dataset.gaaJustDragged = '1';
+        window.setTimeout(() => {
+          delete el.dataset.gaaJustDragged;
+        }, 80);
+      }
+    };
+
+    el.addEventListener('pointerup', endDrag);
+    el.addEventListener('pointercancel', endDrag);
+  }
+
   function ensureUI() {
     if (!document.body) {
       return;
@@ -1800,13 +1944,17 @@
       badgeBtn = document.createElement('button');
       badgeBtn.type = 'button';
       badgeBtn.id = 'gemini-aa-badge';
-      badgeBtn.title = '点击打开设置与多标签状态总览';
+      badgeBtn.title = '点击打开设置与多标签总览（按住可自由拖动位置）';
       badgeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (badgeBtn.dataset.gaaJustDragged) {
+          return;
+        }
         popoverOpen = !popoverOpen;
         popoverEl.classList.toggle('open', popoverOpen);
         if (popoverOpen) {
           renderPopover();
+          positionPopover();
         }
       });
 
@@ -1814,11 +1962,21 @@
       uiRoot.appendChild(popoverEl);
       uiRoot.appendChild(badgeBtn);
       document.body.appendChild(uiRoot);
+
+      makeDraggable(badgeBtn, 'badge', { onMove: positionPopover });
+      makeDraggable(queueDockEl, 'dock', {
+        handleSelector: '.gaa-q-header',
+        allowWhenClass: 'hint-only',
+      });
+      applySavedFixedPos(badgeBtn, 'badge');
     }
   }
 
   function positionQueueDock() {
     if (!queueDockEl || !queueDockEl.classList.contains('visible')) {
+      return;
+    }
+    if (applySavedFixedPos(queueDockEl, 'dock')) {
       return;
     }
     const anchor =
@@ -1827,8 +1985,11 @@
     if (anchor) {
       const rect = anchor.getBoundingClientRect();
       if (rect.width > 120 && rect.top > 80 && rect.top < window.innerHeight) {
-        const bottomPx = Math.max(84, Math.round(window.innerHeight - rect.top + 10));
+        const bottomPx = Math.max(96, Math.round(window.innerHeight - rect.top + 18));
         const centerX = Math.round(rect.left + rect.width / 2);
+        queueDockEl.style.top = 'auto';
+        queueDockEl.style.right = 'auto';
+        queueDockEl.style.transform = 'translateX(-50%)';
         queueDockEl.style.bottom = `${bottomPx}px`;
         queueDockEl.style.left = `${centerX}px`;
         if (!queueDockEl.classList.contains('hint-only')) {
@@ -1840,8 +2001,10 @@
         return;
       }
     }
-    queueDockEl.style.bottom = '122px';
+    queueDockEl.style.top = 'auto';
+    queueDockEl.style.bottom = '136px';
     queueDockEl.style.left = '50%';
+    queueDockEl.style.transform = 'translateX(-50%)';
   }
 
   function renderQueueDock(force) {
@@ -2135,9 +2298,24 @@
     title.className = 'gaa-section-title';
     const titleLeft = document.createElement('span');
     titleLeft.textContent = `Gemini 自动助手 v${SCRIPT_VERSION}`;
-    const titleRight = document.createElement('span');
-    titleRight.textContent = 'Alt+Enter 强制入队';
-    title.append(titleLeft, titleRight);
+    const resetPosBtn = document.createElement('button');
+    resetPosBtn.type = 'button';
+    resetPosBtn.className = 'gaa-icon-btn';
+    resetPosBtn.textContent = '↺ 复位浮窗';
+    resetPosBtn.title = '恢复状态浮窗与排队栏的默认位置';
+    resetPosBtn.addEventListener('click', () => {
+      saveUiPosition('badge', null);
+      saveUiPosition('dock', null);
+      if (badgeBtn) {
+        badgeBtn.style.left = '';
+        badgeBtn.style.top = '';
+        badgeBtn.style.right = '16px';
+        badgeBtn.style.bottom = '118px';
+      }
+      positionQueueDock();
+      positionPopover();
+    });
+    title.append(titleLeft, resetPosBtn);
     popoverEl.appendChild(title);
 
     const toggles = [
@@ -2364,7 +2542,11 @@
       popoverEl.classList.remove('open');
     }
   });
-  window.addEventListener('resize', positionQueueDock);
+  window.addEventListener('resize', () => {
+    applySavedFixedPos(badgeBtn, 'badge');
+    positionQueueDock();
+    positionPopover();
+  });
 
   const observer = new MutationObserver((mutations) => {
     const hasExternalMutation = mutations.some(
