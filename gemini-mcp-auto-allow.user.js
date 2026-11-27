@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Prompt Queue & Multi-Tab)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      3.3.0
-// @description  自动放行 Gemini 工具/任务权限审批卡片；精准监测侧边栏 remy-goal-status-badge 小旗待审批任务并后台自动打开、任务跑完自动关闭临时标签、紧凑窄窗防收缩主题、生成中回车消息排队（逐条/合并混排）与可自由拖动浮窗。
+// @version      3.4.0
+// @description  自动放行 Gemini 工具/任务权限审批卡片；精准监测侧边栏 remy-goal-status-badge 小旗并后台打开/完工自动关闭；支持接入 vLLM Decision 模型智能判断“自动继续”还是“人工选择”（离线自动回退正则）；支持回车消息排队、紧凑窄窗主题与可拖动浮窗。
 // @author       myh333777
 // @match        https://gemini.google.com/*
 // @homepageURL  https://github.com/myh333777/gemini-auto-allow-userscript
@@ -11,13 +11,15 @@
 // @downloadURL  https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js
 // @run-at       document-idle
 // @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
+// @connect      *
 // @license      MIT
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '3.3.0';
+  const SCRIPT_VERSION = '3.4.0';
   const STORAGE_SETTINGS_KEY = 'gemini_aa_settings_v3';
   const STORAGE_QUEUE_PREFIX = 'gemini_aa_queue_v3:';
   const STORAGE_OPENED_FLAGS_KEY = 'gemini_aa_opened_flags_v3';
@@ -40,12 +42,19 @@
   const SIDEBAR_OPEN_GLOBAL_GAP_MS = 2500; // 两次自动打开标签之间至少间隔 2.5 秒
   const AUTO_CLOSE_IDLE_MS = 15000; // 自动打开的任务标签在完工后持续空闲 15 秒即自动关闭
   const AUTO_CLOSE_NO_ACTION_GRACE_MS = 28000; // 若打开后一直无审批也无生成，28 秒后自动关闭
+  const DECISION_TIMEOUT_MS = 4500; // Decision API 超时即回退默认正则
+  const DECISION_BACKOFF_MS = 60000; // Decision API 不可达时 60 秒熔断直走正则
+  const DECISION_MIN_CONTINUE_PROB = 0.75; // 达到该置信度才自动回复“继续”
   // ================================================
 
   const DEFAULT_SETTINGS = {
     autoApprove: true,
     fallbackToChatOrOnce: true,
     autoContinue: true,
+    decisionEnabled: false, // 开启后调用 vLLM Decision System One 判断是否可无人值守继续；不可达自动回退正则
+    decisionApiUrl: '', // 填入 /v1/systemone 接口地址（仅保存在本机浏览器 localStorage）
+    decisionModel: 'vllm-sr/d3-flash',
+    decisionApiKey: '', // 免 Key 网关留空即可
     queueEnabled: true,
     queueMergeByDefault: false, // false = 默认逐条独立发；true = 默认合并到上一条
     sidebarFlagWatch: true, // 监测侧边栏带小旗子/待审批图标的会话并后台自动打开
@@ -137,6 +146,10 @@
   let lastHandledResponseKey = '';
   let pendingContinueTimer = null;
   let pendingContinueCandidateKey = '';
+  let decisionInFlightKey = '';
+  let decisionBackoffUntil = 0;
+  let needsHumanChoice = false;
+  let lastDecisionStatus = ''; // 用于控制台展示最近一次判定结果
 
   // 消息排队状态（按会话路径隔离并持久化）
   let queue = [];
@@ -945,6 +958,96 @@
     });
   }
 
+  function buildDecisionPayload(text, model) {
+    return {
+      model: (model || 'vllm-sr/d3-flash').trim(),
+      state: text.slice(-1200),
+      questions: {
+        reply_action: {
+          type: 'choice',
+          instructions:
+            '判断模型最后这段回复是否可以直接由无人值守脚本自动回复“继续”推进，还是需要人工做实质选择/补充信息，或者任务已经完成无需回复。',
+          criteria: {
+            auto_continue:
+              '模型只是在阶段性汇报后询问是否继续下一步、确认按原计划推进，没有要求用户做多选决策或补充新信息，直接回复继续即可',
+            need_human:
+              '模型给出了多个实质性方案让用户二选一/多选一、询问业务偏好/参数/路径/凭据、或遇到报错需要人工拍板',
+            done_no_reply:
+              '任务已经完整结束或只是普通回答/总结，不需要回复继续',
+          },
+        },
+      },
+    };
+  }
+
+  function parseDecisionResponse(data) {
+    const ans = data?.answers?.reply_action;
+    if (!ans || typeof ans.choice !== 'string') {
+      return null;
+    }
+    const prob =
+      typeof ans.probabilities?.[ans.choice] === 'number'
+        ? ans.probabilities[ans.choice]
+        : typeof ans.confidence === 'number'
+          ? ans.confidence
+          : 0;
+    return { choice: ans.choice, prob };
+  }
+
+  function queryDecisionModel(text) {
+    return new Promise((resolve) => {
+      const url = (settings.decisionApiUrl || '').trim();
+      if (!settings.decisionEnabled || !url || Date.now() < decisionBackoffUntil) {
+        resolve(null);
+        return;
+      }
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        resolve(null);
+        return;
+      }
+
+      const headers = { 'Content-Type': 'application/json' };
+      const key = (settings.decisionApiKey || '').trim();
+      if (key) {
+        headers.Authorization = `Bearer ${key}`;
+      }
+
+      try {
+        GM_xmlhttpRequest({
+          method: 'POST',
+          url,
+          headers,
+          timeout: DECISION_TIMEOUT_MS,
+          data: JSON.stringify(buildDecisionPayload(text, settings.decisionModel)),
+          onload: (res) => {
+            if (res.status >= 200 && res.status < 300) {
+              try {
+                const parsed = parseDecisionResponse(JSON.parse(res.responseText));
+                if (parsed) {
+                  resolve(parsed);
+                  return;
+                }
+              } catch (_) {}
+            }
+            decisionBackoffUntil = Date.now() + DECISION_BACKOFF_MS;
+            resolve(null);
+          },
+          onerror: () => {
+            decisionBackoffUntil = Date.now() + DECISION_BACKOFF_MS;
+            resolve(null);
+          },
+          ontimeout: () => {
+            decisionBackoffUntil = Date.now() + DECISION_BACKOFF_MS;
+            resolve(null);
+          },
+        });
+      } catch (_) {
+        decisionBackoffUntil = Date.now() + DECISION_BACKOFF_MS;
+        resolve(null);
+      }
+    });
+  }
+
   function checkAutoContinue() {
     // 队列里有待发消息时，优先发队列，不插队回复“继续”
     if (
@@ -961,6 +1064,10 @@
     }
 
     if (isGenerating() || hasPendingConfirmationCard()) {
+      if (needsHumanChoice) {
+        needsHumanChoice = false;
+        updateTabTitle();
+      }
       if (pendingContinueTimer) {
         clearTimeout(pendingContinueTimer);
         pendingContinueTimer = null;
@@ -973,11 +1080,18 @@
     }
 
     const info = getLastModelResponseInfo();
-    if (!info || info.key === lastHandledResponseKey) {
+    if (!info || info.key === lastHandledResponseKey || info.key === decisionInFlightKey) {
       return;
     }
 
-    if (!matchesContinueTail(info.tail)) {
+    const canUseDecision =
+      settings.decisionEnabled &&
+      Boolean((settings.decisionApiUrl || '').trim()) &&
+      Date.now() >= decisionBackoffUntil &&
+      typeof GM_xmlhttpRequest === 'function';
+
+    // 未启用 Decision 或处于熔断期时，直接走原有正则预检
+    if (!canUseDecision && !matchesContinueTail(info.tail)) {
       return;
     }
 
@@ -990,7 +1104,22 @@
     }
     pendingContinueCandidateKey = info.key;
 
-    const executeContinue = () => {
+    const doSendContinue = (sourceTag) => {
+      fillAndSubmitPrompt(CONTINUE_TEXT, (ok) => {
+        if (ok) {
+          lastHandledResponseKey = info.key;
+          needsHumanChoice = false;
+          consecutiveContinues += 1;
+          lastDecisionStatus = `${sourceTag}→已自动继续`;
+          markInjected();
+          console.info(
+            `[Gemini Auto Allow] ${sourceTag}判定可继续，已自动回复「${CONTINUE_TEXT}」（${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES}）`
+          );
+        }
+      });
+    };
+
+    const executeContinue = async () => {
       pendingContinueTimer = null;
       if (
         !settings.autoContinue ||
@@ -1005,16 +1134,60 @@
       if (!latest || latest.key !== info.key || latest.key === lastHandledResponseKey) {
         return;
       }
-      fillAndSubmitPrompt(CONTINUE_TEXT, (ok) => {
-        if (ok) {
-          lastHandledResponseKey = latest.key;
-          consecutiveContinues += 1;
-          markInjected();
-          console.info(
-            `[Gemini Auto Allow] 检测到继续提示，已自动回复「${CONTINUE_TEXT}」（${consecutiveContinues}/${MAX_CONSECUTIVE_CONTINUES}）`
-          );
+
+      if (canUseDecision) {
+        decisionInFlightKey = info.key;
+        const verdict = await queryDecisionModel(latest.tail);
+        decisionInFlightKey = '';
+
+        // 异步返回后再次校验状态
+        if (
+          !settings.autoContinue ||
+          queue.length > 0 ||
+          isScriptSubmitting ||
+          isGenerating() ||
+          hasPendingConfirmationCard()
+        ) {
+          return;
         }
-      });
+        const afterLatest = getLastModelResponseInfo();
+        if (!afterLatest || afterLatest.key !== info.key || afterLatest.key === lastHandledResponseKey) {
+          return;
+        }
+
+        if (verdict) {
+          const pct = Math.round(verdict.prob * 100);
+          if (verdict.choice === 'auto_continue' && verdict.prob >= DECISION_MIN_CONTINUE_PROB) {
+            doSendContinue(`Decision(${pct}%)`);
+            return;
+          }
+          lastHandledResponseKey = info.key;
+          if (verdict.choice === 'need_human') {
+            needsHumanChoice = true;
+            lastDecisionStatus = `Decision:需人工选择(${pct}%)`;
+            console.info(
+              `[Gemini Auto Allow] Decision 判定需人工选择（${pct}%），已暂停自动继续并保留标签页`
+            );
+          } else {
+            needsHumanChoice = false;
+            lastDecisionStatus = `Decision:已结束无需续(${pct}%)`;
+          }
+          markInjected();
+          return;
+        }
+
+        // Decision API 不通/超时 -> 自动静默回退默认正则模式
+        lastDecisionStatus = 'Decision离线→回退正则';
+        console.warn('[Gemini Auto Allow] Decision API 不可达，已自动回退正则模式');
+        if (!matchesContinueTail(afterLatest.tail)) {
+          lastHandledResponseKey = info.key;
+          return;
+        }
+        doSendContinue('正则回退');
+        return;
+      }
+
+      doSendContinue('正则模式');
     };
 
     if (document.hidden) {
@@ -1034,6 +1207,8 @@
     consecutiveContinues = 0;
     lastHandledResponseKey = '';
     pendingContinueCandidateKey = '';
+    decisionInFlightKey = '';
+    needsHumanChoice = false;
     editingItemId = null;
     if (pendingContinueTimer) {
       clearTimeout(pendingContinueTimer);
@@ -1075,7 +1250,7 @@
 
   function cleanTitle(raw) {
     return (raw || 'Gemini')
-      .replace(/^\[(?:⏳审批|⚡运行|📋排队\d+|⏸暂停\d+)\]\s*/, '')
+      .replace(/^\[(?:⏳审批|🙋待选择|⚡运行|📋排队\d+|⏸暂停\d+)\]\s*/, '')
       .trim();
   }
 
@@ -1094,6 +1269,8 @@
     let prefix = '';
     if (state === 'approval') {
       prefix = '[⏳审批] ';
+    } else if (needsHumanChoice) {
+      prefix = '[🙋待选择] ';
     } else if (queuePaused && queue.length > 0) {
       prefix = `[⏸暂停${queue.length}] `;
     } else if (queue.length > 0) {
@@ -1426,7 +1603,9 @@
       hasPendingConfirmationCard() ||
       queue.length > 0 ||
       isScriptSubmitting ||
-      Boolean(pendingContinueTimer);
+      Boolean(pendingContinueTimer) ||
+      Boolean(decisionInFlightKey) ||
+      needsHumanChoice;
 
     if (clickCount > 0 || isGenerating() || hasPendingConfirmationCard()) {
       sawActivityInAutoTab = true;
@@ -2455,6 +2634,10 @@
         key: 'autoContinue',
       },
       {
+        label: 'Decision 模型智能判断（离线回退正则）',
+        key: 'decisionEnabled',
+      },
+      {
         label: '标签页标题显示运行状态',
         key: 'titleStatusEnabled',
       },
@@ -2490,6 +2673,90 @@
       row.appendChild(lbl);
       row.appendChild(btn);
       popoverEl.appendChild(row);
+    }
+
+    // Decision 模型配置区（仅开启时展开，配置仅存本机 localStorage）
+    if (settings.decisionEnabled) {
+      const box = document.createElement('div');
+      box.style.cssText =
+        'margin:6px 0 8px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);display:flex;flex-direction:column;gap:6px;';
+
+      const mkInput = (placeholder, value, onSave, isSecret) => {
+        const inp = document.createElement('input');
+        inp.type = isSecret ? 'password' : 'text';
+        inp.placeholder = placeholder;
+        inp.value = value || '';
+        inp.style.cssText =
+          'width:100%;box-sizing:border-box;padding:4px 7px;border-radius:6px;border:1px solid rgba(255,255,255,0.16);background:rgba(16,17,22,0.9);color:#e8eaed;font-size:11px;';
+        inp.addEventListener('change', () => {
+          onSave(inp.value.trim());
+          decisionBackoffUntil = 0;
+          saveSettings();
+        });
+        inp.addEventListener('keydown', (e) => e.stopPropagation());
+        return inp;
+      };
+
+      box.appendChild(
+        mkInput(
+          'Decision API 地址（.../v1/systemone）',
+          settings.decisionApiUrl,
+          (v) => {
+            settings.decisionApiUrl = v;
+          },
+          false
+        )
+      );
+      box.appendChild(
+        mkInput(
+          '模型（默认 vllm-sr/d3-flash）',
+          settings.decisionModel,
+          (v) => {
+            settings.decisionModel = v || 'vllm-sr/d3-flash';
+          },
+          false
+        )
+      );
+      box.appendChild(
+        mkInput(
+          'API Key（免 Key 网关留空即可）',
+          settings.decisionApiKey,
+          (v) => {
+            settings.decisionApiKey = v;
+          },
+          true
+        )
+      );
+
+      const foot = document.createElement('div');
+      foot.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:6px;';
+      const statusSpan = document.createElement('span');
+      statusSpan.style.cssText = 'font-size:10px;color:#9aa0a6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      statusSpan.textContent =
+        lastDecisionStatus ||
+        (settings.decisionApiUrl ? '已配置（离线自动回退正则）' : '未填地址（当前走正则）');
+
+      const testBtn = document.createElement('button');
+      testBtn.type = 'button';
+      testBtn.className = 'gaa-icon-btn';
+      testBtn.textContent = '测试连通';
+      testBtn.addEventListener('click', async () => {
+        decisionBackoffUntil = 0;
+        statusSpan.textContent = '测试中...';
+        const res = await queryDecisionModel(
+          '第一步已完成，接下来将执行第二步，请回复继续。'
+        );
+        if (res) {
+          lastDecisionStatus = `✅ ${res.choice}(${Math.round(res.prob * 100)}%)`;
+        } else {
+          lastDecisionStatus = '⚠️ 不可达(自动回退正则)';
+        }
+        statusSpan.textContent = lastDecisionStatus;
+      });
+
+      foot.append(statusSpan, testBtn);
+      box.appendChild(foot);
+      popoverEl.appendChild(box);
     }
 
     if (settings.sidebarFlagWatch && sidebarCollapsedHint) {
