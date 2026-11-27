@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Prompt Queue & Multi-Tab)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      3.1.0
-// @description  自动放行 Gemini 工具/任务权限审批卡片；支持监控侧边栏小旗待审批任务并后台自动打开处理、生成中回车消息排队（逐条/合并混排）、SPA 切会话状态重置与多标签总览。
+// @version      3.2.0
+// @description  自动放行 Gemini 工具/任务权限审批卡片；支持监控侧边栏小旗待审批任务并后台自动打开、紧凑窄窗防收缩主题、生成中回车消息排队（逐条/合并混排）、SPA 切会话重置与多标签总览。
 // @author       myh333777
 // @match        https://gemini.google.com/*
 // @homepageURL  https://github.com/myh333777/gemini-auto-allow-userscript
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '3.1.0';
+  const SCRIPT_VERSION = '3.2.0';
   const STORAGE_SETTINGS_KEY = 'gemini_aa_settings_v3';
   const STORAGE_QUEUE_PREFIX = 'gemini_aa_queue_v3:';
   const STORAGE_OPENED_FLAGS_KEY = 'gemini_aa_opened_flags_v3';
@@ -46,6 +46,7 @@
     queueEnabled: true,
     queueMergeByDefault: false, // false = 默认逐条独立发；true = 默认合并到上一条
     sidebarFlagWatch: true, // 监测侧边栏带小旗子/待审批图标的会话并后台自动打开
+    compactNarrowTheme: true, // 紧凑窄窗主题：收紧留白并在窄窗下保持侧边栏并排不收缩
     titleStatusEnabled: true,
   };
 
@@ -149,6 +150,8 @@
   let lastSidebarOpenAt = 0;
   let autoOpenedCount = 0;
   let sidebarCollapsedHint = false;
+  let autoExpandedSidebarOnce = false;
+  let userClosedSidebar = false;
 
   // UI 节点引用
   let uiRoot = null;
@@ -1398,6 +1401,37 @@
     }
   }
 
+  function applyCompactTheme() {
+    if (!document.documentElement) {
+      return;
+    }
+    const enabled = Boolean(settings.compactNarrowTheme);
+    document.documentElement.classList.toggle('gaa-compact-theme', enabled);
+
+    // 窄窗（>= 640px）且开启紧凑主题 + 小旗监测时，自动展开一次侧边栏使其并排常驻
+    if (
+      enabled &&
+      settings.sidebarFlagWatch &&
+      !autoExpandedSidebarOnce &&
+      !userClosedSidebar &&
+      window.innerWidth >= 640
+    ) {
+      const sidenav = document.querySelector('mat-sidenav, bard-sidenav');
+      if (sidenav && !sidenav.classList.contains('mat-drawer-opened')) {
+        const menuBtn = document.querySelector(
+          'button[aria-label="Main menu"], button[aria-label="Open sidebar"], button[aria-label*="展开侧边栏"], button[aria-label*="主菜单"]'
+        );
+        if (menuBtn && isButtonEnabled(menuBtn)) {
+          autoExpandedSidebarOnce = true;
+          menuBtn.click();
+          window.setTimeout(positionQueueDock, 260);
+        }
+      } else if (sidenav && sidenav.classList.contains('mat-drawer-opened')) {
+        autoExpandedSidebarOnce = true;
+      }
+    }
+  }
+
   // ==================== 模块 6：UI（输入框上方队列面板 + 右下角控制台） ====================
   function ensureStyles() {
     if (document.getElementById('gemini-aa-style')) {
@@ -1665,6 +1699,47 @@
         background: rgba(138, 180, 248, 0.24);
         border-color: rgba(138, 180, 248, 0.6);
         color: #8ab4f8;
+      }
+
+      /* ===== 紧凑窄窗主题（防止小窗口侧边栏收缩 & 收紧留白） ===== */
+      @media (min-width: 640px) {
+        html.gaa-compact-theme mat-sidenav.mat-drawer,
+        html.gaa-compact-theme bard-sidenav.mat-drawer {
+          width: 216px !important;
+          min-width: 216px !important;
+          max-width: 216px !important;
+        }
+        html.gaa-compact-theme mat-sidenav.mat-drawer-over.mat-drawer-opened,
+        html.gaa-compact-theme bard-sidenav.mat-drawer-over.mat-drawer-opened {
+          box-shadow: none !important;
+          border-right: 1px solid rgba(128, 128, 128, 0.22) !important;
+        }
+        html.gaa-compact-theme .mat-drawer-backdrop.mat-drawer-shown {
+          display: none !important;
+          pointer-events: none !important;
+        }
+        html.gaa-compact-theme mat-sidenav.mat-drawer-over.mat-drawer-opened ~ mat-sidenav-content,
+        html.gaa-compact-theme bard-sidenav.mat-drawer-over.mat-drawer-opened ~ mat-sidenav-content {
+          margin-left: 216px !important;
+          width: calc(100% - 216px) !important;
+        }
+        html.gaa-compact-theme gem-nav-list-item[data-test-id="conversation"] a.mat-mdc-list-item {
+          padding-left: 8px !important;
+          padding-right: 6px !important;
+          min-height: 32px !important;
+          height: 32px !important;
+          font-size: 12.5px !important;
+        }
+        html.gaa-compact-theme .input-area-container,
+        html.gaa-compact-theme chat-window .conversation-container,
+        html.gaa-compact-theme chat-window-content {
+          padding-left: 10px !important;
+          padding-right: 10px !important;
+        }
+        html.gaa-compact-theme .input-area-container {
+          max-width: 100% !important;
+          width: 100% !important;
+        }
       }
     `;
     document.head.appendChild(style);
@@ -2042,6 +2117,10 @@
         key: 'sidebarFlagWatch',
       },
       {
+        label: '紧凑窄窗主题（防侧边栏收缩）',
+        key: 'compactNarrowTheme',
+      },
+      {
         label: '回车消息排队（Prompt Queue）',
         key: 'queueEnabled',
       },
@@ -2073,6 +2152,12 @@
         settings[item.key] = !settings[item.key];
         if (item.key === 'autoContinue' && settings.autoContinue) {
           consecutiveContinues = 0;
+        }
+        if (item.key === 'compactNarrowTheme') {
+          autoExpandedSidebarOnce = false;
+          userClosedSidebar = false;
+          applyCompactTheme();
+          window.setTimeout(positionQueueDock, 200);
         }
         saveSettings();
         renderQueueDock();
@@ -2182,6 +2267,7 @@
   function scan() {
     scanScheduled = false;
     onRouteChange();
+    applyCompactTheme();
     collectConfirmationContainers().forEach(handleCard);
     flushStuckApprovalInput();
     checkSidebarApprovalFlags();
@@ -2232,6 +2318,10 @@
   markInjected();
 
   document.addEventListener('click', (e) => {
+    const closeBtn = e.target?.closest?.('button[aria-label="Close sidebar"], button[aria-label*="收起侧边栏"]');
+    if (closeBtn) {
+      userClosedSidebar = true;
+    }
     if (popoverOpen && popoverEl && badgeBtn && !popoverEl.contains(e.target) && !badgeBtn.contains(e.target)) {
       popoverOpen = false;
       popoverEl.classList.remove('open');
