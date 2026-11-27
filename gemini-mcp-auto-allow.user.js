@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Prompt Queue & Multi-Tab)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      3.2.0
-// @description  自动放行 Gemini 工具/任务权限审批卡片；支持监控侧边栏小旗待审批任务并后台自动打开、紧凑窄窗防收缩主题、生成中回车消息排队（逐条/合并混排）、SPA 切会话重置与多标签总览。
+// @version      3.2.1
+// @description  自动放行 Gemini 工具/任务权限审批卡片；精准监测侧边栏 remy-goal-status-badge 小旗待审批任务并后台自动打开、紧凑窄窗防收缩主题、生成中回车消息排队（逐条/合并混排）、SPA 切会话重置与多标签总览。
 // @author       myh333777
 // @match        https://gemini.google.com/*
 // @homepageURL  https://github.com/myh333777/gemini-auto-allow-userscript
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '3.2.0';
+  const SCRIPT_VERSION = '3.2.1';
   const STORAGE_SETTINGS_KEY = 'gemini_aa_settings_v3';
   const STORAGE_QUEUE_PREFIX = 'gemini_aa_queue_v3:';
   const STORAGE_OPENED_FLAGS_KEY = 'gemini_aa_opened_flags_v3';
@@ -1225,8 +1225,45 @@
     return { convId, url, title, rendered: Boolean(anchor) };
   }
 
+  const REMY_BADGE_NON_APPROVAL_ICONS = new Set([
+    'progress_activity',
+    'check',
+    'check_circle',
+    'check_circle_outline',
+    'done',
+    'done_all',
+    'task_alt',
+  ]);
+
   function detectSidebarFlagReason(item) {
-    // 1. 检查所有 mat-icon（排除置顶 push_pin、更多菜单 more_vert 等常规图标）
+    // 0. 最高精度：直接检测 Gemini 任务状态徽章 <remy-goal-status-badge>
+    // 空徽章=普通会话；in-progress/spinning/progress_activity=后台运行中（在转圈）；
+    // completed/check=已完成；其余任意图标（小旗子/等待审批/需要输入等）均视为待审批/待处理！
+    const remyBadge = item.querySelector('remy-goal-status-badge');
+    if (remyBadge) {
+      const badgeIconWrap = remyBadge.querySelector('gem-icon');
+      const badgeMatIcon = remyBadge.querySelector('mat-icon');
+      if (badgeIconWrap || badgeMatIcon) {
+        const wrapCls = typeof badgeIconWrap?.className === 'string' ? badgeIconWrap.className : '';
+        const fonticon = (
+          badgeMatIcon?.getAttribute('fonticon') ||
+          badgeMatIcon?.getAttribute('data-mat-icon-name') ||
+          badgeMatIcon?.textContent ||
+          ''
+        ).trim();
+        const isSpinning =
+          /\b(?:in-progress|spinning|loading)\b/i.test(wrapCls) ||
+          fonticon.toLowerCase() === 'progress_activity';
+        const isCompleted =
+          /\b(?:completed|success|done)\b/i.test(wrapCls) ||
+          REMY_BADGE_NON_APPROVAL_ICONS.has(fonticon.toLowerCase());
+        if (!isSpinning && !isCompleted) {
+          return `remy-badge:${fonticon || wrapCls.slice(0, 40) || 'waiting'}`;
+        }
+      }
+    }
+
+    // 1. 兜底检查其他位置的 mat-icon（排除置顶 push_pin、更多菜单 more_vert 等常规图标）
     const icons = item.querySelectorAll('mat-icon');
     for (const ic of icons) {
       if (ic.closest('button[aria-label*="More options"], button[aria-label*="更多"]')) {
