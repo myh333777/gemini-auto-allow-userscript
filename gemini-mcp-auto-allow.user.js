@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Prompt Queue & Multi-Tab)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      3.0.0
-// @description  自动放行 Gemini 工具/任务权限审批卡片；支持生成中回车消息排队（逐条发送/与上条合并自由切换）、SPA 切会话状态重置与多标签状态总览。
+// @version      3.1.0
+// @description  自动放行 Gemini 工具/任务权限审批卡片；支持监控侧边栏小旗待审批任务并后台自动打开处理、生成中回车消息排队（逐条/合并混排）、SPA 切会话状态重置与多标签总览。
 // @author       myh333777
 // @match        https://gemini.google.com/*
 // @homepageURL  https://github.com/myh333777/gemini-auto-allow-userscript
@@ -10,16 +10,17 @@
 // @updateURL    https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js
 // @downloadURL  https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js
 // @run-at       document-idle
-// @grant        none
+// @grant        GM_openInTab
 // @license      MIT
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '3.0.0';
+  const SCRIPT_VERSION = '3.1.0';
   const STORAGE_SETTINGS_KEY = 'gemini_aa_settings_v3';
   const STORAGE_QUEUE_PREFIX = 'gemini_aa_queue_v3:';
+  const STORAGE_OPENED_FLAGS_KEY = 'gemini_aa_opened_flags_v3';
   const TAB_CHANNEL_NAME = 'gemini-auto-allow-v3-tabs';
   const TAB_ID = `tab_${Math.random().toString(36).slice(2, 9)}`;
 
@@ -34,6 +35,8 @@
   const QUEUE_DISPATCH_STABLE_MS = 1300;
   const POST_DISPATCH_COOLDOWN_MS = 3200;
   const STUCK_APPROVAL_SEND_DELAY_MS = 600;
+  const SIDEBAR_OPEN_COOLDOWN_MS = 90000; // 同一待审批会话 90 秒内不重复后台打开
+  const SIDEBAR_OPEN_GLOBAL_GAP_MS = 2500; // 两次自动打开标签之间至少间隔 2.5 秒
   // ================================================
 
   const DEFAULT_SETTINGS = {
@@ -42,6 +45,7 @@
     autoContinue: true,
     queueEnabled: true,
     queueMergeByDefault: false, // false = 默认逐条独立发；true = 默认合并到上一条
+    sidebarFlagWatch: true, // 监测侧边栏带小旗子/待审批图标的会话并后台自动打开
     titleStatusEnabled: true,
   };
 
@@ -142,6 +146,9 @@
   const peerTabs = new Map();
   let tabChannel = null;
   let basePageTitle = document.title || 'Gemini';
+  let lastSidebarOpenAt = 0;
+  let autoOpenedCount = 0;
+  let sidebarCollapsedHint = false;
 
   // UI 节点引用
   let uiRoot = null;
@@ -1118,6 +1125,12 @@
           peerTabs.delete(data.tabId);
         } else if (data.type === 'heartbeat') {
           peerTabs.set(data.tabId, data);
+        } else if (data.type === 'opening-conv' && data.convId) {
+          const map = loadOpenedFlagsMap();
+          map[data.convId] = Math.max(map[data.convId] || 0, data.ts || Date.now());
+          try {
+            localStorage.setItem(STORAGE_OPENED_FLAGS_KEY, JSON.stringify(map));
+          } catch (_) {}
         }
         updateBadge();
         if (popoverOpen) {
@@ -1148,6 +1161,241 @@
       });
     }
     return list;
+  }
+
+  // ==================== 模块 5.5：侧边栏待审批小旗监测 & 后台自动打开 ====================
+  const SIDEBAR_IGNORED_ICONS = new Set([
+    'push_pin',
+    'keep',
+    'more_vert',
+    'more_horiz',
+    'edit',
+    'delete',
+    'share',
+    'chat',
+    'chat_bubble',
+    'gemini_chat',
+    'lock',
+    'public',
+  ]);
+
+  const SIDEBAR_FLAG_ICON_PATTERN =
+    /(?:^|_)(?:flag|outlined_flag|flag_2|flag_circle|assistant_flag|tour|priority_high|notification_important|notifications_active|approval|pending_actions|action_required|waiting|attention|warning|error_outline)(?:$|_)/i;
+
+  const SIDEBAR_FLAG_ATTR_PATTERN =
+    /(?:waiting|action[\s_-]*required|needs?[\s_-]*(?:your[\s_-]*)?(?:input|approval|review|attention)|permission|flag|等待|需要审批|需要操作|待审批|待确认|待处理)/i;
+
+  function extractConversationIdFromPath(pathOrUrl) {
+    if (!pathOrUrl) {
+      return '';
+    }
+    const m = String(pathOrUrl).match(/\/(?:app|spark)\/([a-zA-Z0-9_-]+)/);
+    return m ? m[1] : '';
+  }
+
+  function extractConversationInfo(item) {
+    const rawAttrId = (item.getAttribute('data-conversation-id') || '').replace(/^c_/, '');
+    const anchor = item.tagName === 'A' ? item : item.querySelector('a[href]');
+    const rawHref = anchor ? anchor.getAttribute('href') : '';
+    const hrefId = extractConversationIdFromPath(rawHref);
+    const convId = rawAttrId || hrefId;
+    if (!convId) {
+      return null;
+    }
+
+    let url = '';
+    if (rawHref) {
+      try {
+        const parsed = new URL(rawHref, location.origin);
+        if (parsed.origin === location.origin) {
+          url = parsed.href;
+        }
+      } catch (_) {}
+    }
+    if (!url) {
+      const accountPrefixMatch = location.pathname.match(/^(\/u\/\d+)/);
+      const prefix = accountPrefixMatch ? accountPrefixMatch[1] : '';
+      url = `${location.origin}${prefix}/app/${convId}`;
+    }
+
+    const title = normalizeText(anchor || item).slice(0, 60) || convId;
+    return { convId, url, title, rendered: Boolean(anchor) };
+  }
+
+  function detectSidebarFlagReason(item) {
+    // 1. 检查所有 mat-icon（排除置顶 push_pin、更多菜单 more_vert 等常规图标）
+    const icons = item.querySelectorAll('mat-icon');
+    for (const ic of icons) {
+      if (ic.closest('button[aria-label*="More options"], button[aria-label*="更多"]')) {
+        continue;
+      }
+      const fonticon = (ic.getAttribute('fonticon') || '').trim();
+      const matName = (ic.getAttribute('data-mat-icon-name') || '').trim();
+      const iconText = (ic.textContent || '').trim();
+      const aria = (ic.getAttribute('aria-label') || '').trim();
+      const cls = typeof ic.className === 'string' ? ic.className : '';
+
+      const primaryName = fonticon || matName || iconText;
+      if (primaryName && SIDEBAR_IGNORED_ICONS.has(primaryName.toLowerCase())) {
+        continue;
+      }
+      if (
+        (primaryName && SIDEBAR_FLAG_ICON_PATTERN.test(primaryName)) ||
+        (aria && SIDEBAR_FLAG_ATTR_PATTERN.test(aria)) ||
+        (cls && /\b(?:flag|waiting|attention|needs-input|approval)\b/i.test(cls))
+      ) {
+        return `icon:${primaryName || aria || 'flag'}`;
+      }
+    }
+
+    // 2. 检查非操作按钮区域的语义属性 / data-test-id / 可见状态标记
+    const taggedNodes = item.querySelectorAll(
+      '[aria-label], [title], [data-test-id], [class*="flag"], [class*="waiting"], [class*="attention"], [class*="needs-input"]'
+    );
+    for (const el of taggedNodes) {
+      if (el.closest('button[aria-label*="More options"], button[aria-label*="更多"]')) {
+        continue;
+      }
+      const aria = el.getAttribute('aria-label') || '';
+      const titleAttr = el.getAttribute('title') || '';
+      const testId = el.getAttribute('data-test-id') || '';
+      const cls = typeof el.className === 'string' ? el.className : '';
+      if (testId === 'conversation') {
+        continue;
+      }
+      if (
+        SIDEBAR_FLAG_ATTR_PATTERN.test(aria) ||
+        SIDEBAR_FLAG_ATTR_PATTERN.test(titleAttr) ||
+        SIDEBAR_FLAG_ATTR_PATTERN.test(testId) ||
+        /\b(?:flag|waiting|attention|needs-input|approval-badge)\b/i.test(cls)
+      ) {
+        return `attr:${testId || aria || titleAttr || cls.slice(0, 30)}`;
+      }
+    }
+
+    return null;
+  }
+
+  function loadOpenedFlagsMap() {
+    try {
+      const raw = localStorage.getItem(STORAGE_OPENED_FLAGS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          const now = Date.now();
+          const cleaned = {};
+          for (const [k, ts] of Object.entries(parsed)) {
+            if (typeof ts === 'number' && now - ts < SIDEBAR_OPEN_COOLDOWN_MS * 4) {
+              cleaned[k] = ts;
+            }
+          }
+          return cleaned;
+        }
+      }
+    } catch (_) {}
+    return {};
+  }
+
+  function markFlagOpened(convId) {
+    const map = loadOpenedFlagsMap();
+    map[convId] = Date.now();
+    try {
+      localStorage.setItem(STORAGE_OPENED_FLAGS_KEY, JSON.stringify(map));
+    } catch (_) {}
+    if (tabChannel) {
+      try {
+        tabChannel.postMessage({ type: 'opening-conv', tabId: TAB_ID, convId, ts: Date.now() });
+      } catch (_) {}
+    }
+  }
+
+  function isConversationOpenInAnyTab(convId) {
+    if (!convId) {
+      return false;
+    }
+    if (extractConversationIdFromPath(location.pathname) === convId) {
+      return true;
+    }
+    const peers = getActivePeerTabs();
+    return peers.some(
+      (p) => !p.maybeFrozen && extractConversationIdFromPath(p.path) === convId
+    );
+  }
+
+  function openUrlInBackground(url) {
+    const targetUrl = url.includes('#') ? url : `${url}#gaa_auto=1`;
+    try {
+      if (typeof GM_openInTab === 'function') {
+        GM_openInTab(targetUrl, { active: false, insert: true, setParent: true });
+        return true;
+      }
+    } catch (err) {
+      console.warn('[Gemini Auto Allow] GM_openInTab 调用失败，尝试回退 window.open:', err);
+    }
+    try {
+      const win = window.open(targetUrl, '_blank', 'noopener');
+      return Boolean(win);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function checkSidebarApprovalFlags() {
+    if (!settings.sidebarFlagWatch || !settings.autoApprove) {
+      return;
+    }
+    const items = [
+      ...document.querySelectorAll(
+        'gem-nav-list-item[data-test-id="conversation"], [data-test-id="conversation"]'
+      ),
+    ];
+    if (items.length === 0) {
+      sidebarCollapsedHint = false;
+      return;
+    }
+
+    const renderedCount = items.filter((el) => Boolean(el.querySelector('a[href]'))).length;
+    sidebarCollapsedHint = renderedCount === 0;
+    if (sidebarCollapsedHint) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastSidebarOpenAt < SIDEBAR_OPEN_GLOBAL_GAP_MS) {
+      return;
+    }
+
+    const openedMap = loadOpenedFlagsMap();
+
+    for (const item of items) {
+      const reason = detectSidebarFlagReason(item);
+      if (!reason) {
+        continue;
+      }
+      const info = extractConversationInfo(item);
+      if (!info) {
+        continue;
+      }
+      if (isConversationOpenInAnyTab(info.convId)) {
+        continue;
+      }
+      const lastOpened = openedMap[info.convId] || 0;
+      if (now - lastOpened < SIDEBAR_OPEN_COOLDOWN_MS) {
+        continue;
+      }
+
+      // 抢占锁并后台打开
+      markFlagOpened(info.convId);
+      lastSidebarOpenAt = now;
+      if (openUrlInBackground(info.url)) {
+        autoOpenedCount += 1;
+        console.info(
+          `[Gemini Auto Allow] 监测到侧边栏待审批任务「${info.title}」(${reason})，已后台自动打开处理：${info.url}`
+        );
+        markInjected();
+      }
+      break; // 每轮最多打开 1 个，避免连弹标签
+    }
   }
 
   // ==================== 模块 6：UI（输入框上方队列面板 + 右下角控制台） ====================
@@ -1790,6 +2038,10 @@
         key: 'fallbackToChatOrOnce',
       },
       {
+        label: `监测侧边栏小旗并后台打开${autoOpenedCount > 0 ? `(${autoOpenedCount})` : ''}`,
+        key: 'sidebarFlagWatch',
+      },
+      {
         label: '回车消息排队（Prompt Queue）',
         key: 'queueEnabled',
       },
@@ -1831,6 +2083,13 @@
       row.appendChild(lbl);
       row.appendChild(btn);
       popoverEl.appendChild(row);
+    }
+
+    if (settings.sidebarFlagWatch && sidebarCollapsedHint) {
+      const tip = document.createElement('div');
+      tip.style.cssText = 'font-size:11px;color:#fdd663;margin:4px 0 6px;line-height:1.4;';
+      tip.textContent = '⚠️ 侧边栏当前已收起：请保持左侧对话栏展开，脚本才能看到远端任务的小旗子图标。';
+      popoverEl.appendChild(tip);
     }
 
     // 多标签总览
@@ -1925,6 +2184,7 @@
     onRouteChange();
     collectConfirmationContainers().forEach(handleCard);
     flushStuckApprovalInput();
+    checkSidebarApprovalFlags();
     checkQueueDispatch();
     checkAutoContinue();
     renderQueueDock();

@@ -5,22 +5,27 @@
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v3.0.0-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v3.0.0"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v3.1.0-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v3.1.0"></a>
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v3.0.0-3776AB?style=flat-square" alt="Version v3.0.0"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v3.1.0-3776AB?style=flat-square" alt="Version v3.1.0"></a>
   <img src="https://img.shields.io/badge/Target-gemini.google.com-4B5563?style=flat-square" alt="Target gemini.google.com">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E?style=flat-square" alt="License: MIT"></a>
 </p>
 
-## 核心功能（v3.0.0）
+## 核心功能（v3.1.0）
 
 1. **全覆盖自动审批**
    - 同时监听 `remy-confirmation-card`、`remy-confirmation-card-v2`、`spark-waiting-for-user-banner` 以及 `[role="dialog"]` / `[role="alertdialog"]`（内置删除对话/清空记录类危险弹窗黑名单防误点）。
    - 放宽按钮前缀匹配，兼容带工具名/角标的按钮（如「始终允许 @mac3」「Always allow for ...」「允许一次 (shell)」），并优先排除「不允许 / Don't allow」。
    - 自动补发滞留在输入框里的审批文本，防止后台失焦态下点击后卡住不提交。
-2. **输入消息排队（Prompt Queue）**
+2. **远程任务侧边栏「小旗子」自动监测 & 后台打开审批（新增）**
+   - 适合你在手机或其他设备上发起 Gemini 任务、本地电脑挂着浏览器自动代审批的场景。
+   - 持续监测左侧对话栏中带小旗子 / 待审批标志的会话，使用 `@grant GM_openInTab` 在后台静默打开该会话标签页（不抢焦点），新标签页会自动完成审批并继续运行。
+   - 内置**当前页去重 + 跨标签去重（BroadcastChannel）+ 90 秒跨标签冷却锁（localStorage）**，不会重复弹窗或炸标签页。
+   - **提示**：作为监控端的 Gemini 标签页请保持**左侧对话栏处于展开状态**（收起时 Gemini 不会渲染列表项内的图标）。
+3. **输入消息排队（Prompt Queue）**
    - Gemini 回复生成中、等待审批或已有排队项时，在输入框直接打字按 **Enter**（或点击发送），内容会立刻收进**输入框正上方的排队浮层**，不再被吞掉或干等；空闲时按 `Alt + Enter` 也可强制先入队。
    - **合并 / 逐条自由混排**：
      - 顶部可一键切换默认行为：`✂️ 逐条发` 或 `🔗 合并上条`；
