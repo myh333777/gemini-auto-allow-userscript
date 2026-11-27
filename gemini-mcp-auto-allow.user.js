@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gemini MCP & Task Auto Always Allow (+ Prompt Queue & Multi-Tab)
 // @namespace    https://github.com/myh333777/gemini-auto-allow-userscript
-// @version      3.2.2
-// @description  自动放行 Gemini 工具/任务权限审批卡片；精准监测侧边栏 remy-goal-status-badge 小旗待审批任务并后台自动打开、紧凑窄窗防收缩主题、生成中回车消息排队（逐条/合并混排）、可自由拖动浮窗与多标签总览。
+// @version      3.3.0
+// @description  自动放行 Gemini 工具/任务权限审批卡片；精准监测侧边栏 remy-goal-status-badge 小旗待审批任务并后台自动打开、任务跑完自动关闭临时标签、紧凑窄窗防收缩主题、生成中回车消息排队（逐条/合并混排）与可自由拖动浮窗。
 // @author       myh333777
 // @match        https://gemini.google.com/*
 // @homepageURL  https://github.com/myh333777/gemini-auto-allow-userscript
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '3.2.2';
+  const SCRIPT_VERSION = '3.3.0';
   const STORAGE_SETTINGS_KEY = 'gemini_aa_settings_v3';
   const STORAGE_QUEUE_PREFIX = 'gemini_aa_queue_v3:';
   const STORAGE_OPENED_FLAGS_KEY = 'gemini_aa_opened_flags_v3';
@@ -38,6 +38,8 @@
   const STUCK_APPROVAL_SEND_DELAY_MS = 600;
   const SIDEBAR_OPEN_COOLDOWN_MS = 90000; // 同一待审批会话 90 秒内不重复后台打开
   const SIDEBAR_OPEN_GLOBAL_GAP_MS = 2500; // 两次自动打开标签之间至少间隔 2.5 秒
+  const AUTO_CLOSE_IDLE_MS = 15000; // 自动打开的任务标签在完工后持续空闲 15 秒即自动关闭
+  const AUTO_CLOSE_NO_ACTION_GRACE_MS = 28000; // 若打开后一直无审批也无生成，28 秒后自动关闭
   // ================================================
 
   const DEFAULT_SETTINGS = {
@@ -47,6 +49,7 @@
     queueEnabled: true,
     queueMergeByDefault: false, // false = 默认逐条独立发；true = 默认合并到上一条
     sidebarFlagWatch: true, // 监测侧边栏带小旗子/待审批图标的会话并后台自动打开
+    autoCloseHandledTab: true, // 自动打开的待审批标签在任务彻底跑完后自动关闭
     compactNarrowTheme: true, // 紧凑窄窗主题：收紧留白并在窄窗下保持侧边栏并排不收缩
     titleStatusEnabled: true,
   };
@@ -153,6 +156,18 @@
   let sidebarCollapsedHint = false;
   let autoExpandedSidebarOnce = false;
   let userClosedSidebar = false;
+
+  // 状态跳变锁：记录当前已处理的小旗会话；只有当侧边栏里该会话的小旗消失后再重新出现，才会再次打开（防止缓存残留小旗反复重开）
+  const latchedFlaggedConvIds = new Set();
+  // 父标签保存 GM_openInTab 返回的句柄，子标签完工广播时双保险关闭
+  const openedTabHandles = new Map();
+
+  // 当前标签是否由侧边栏监测自动打开（#gaa_auto=1）
+  const isAutoOpenedTab = location.hash.includes('gaa_auto=1');
+  const tabLoadedAt = Date.now();
+  let sawActivityInAutoTab = false;
+  let autoTabIdleSince = 0;
+  let autoTabCloseSent = false;
 
   // UI 节点引用
   let uiRoot = null;
@@ -1135,6 +1150,14 @@
           try {
             localStorage.setItem(STORAGE_OPENED_FLAGS_KEY, JSON.stringify(map));
           } catch (_) {}
+        } else if (data.type === 'auto-tab-done' && data.convId) {
+          const handle = openedTabHandles.get(data.convId);
+          if (handle && typeof handle.close === 'function') {
+            try {
+              handle.close();
+            } catch (_) {}
+          }
+          openedTabHandles.delete(data.convId);
         }
         updateBadge();
         if (popoverOpen) {
@@ -1363,11 +1386,18 @@
     );
   }
 
-  function openUrlInBackground(url) {
+  function openUrlInBackground(url, convId) {
     const targetUrl = url.includes('#') ? url : `${url}#gaa_auto=1`;
     try {
       if (typeof GM_openInTab === 'function') {
-        GM_openInTab(targetUrl, { active: false, insert: true, setParent: true });
+        const handle = GM_openInTab(targetUrl, {
+          active: false,
+          insert: true,
+          setParent: true,
+        });
+        if (handle && convId) {
+          openedTabHandles.set(convId, handle);
+        }
         return true;
       }
     } catch (err) {
@@ -1375,9 +1405,62 @@
     }
     try {
       const win = window.open(targetUrl, '_blank', 'noopener');
+      if (win && convId) {
+        openedTabHandles.set(convId, win);
+      }
       return Boolean(win);
     } catch (_) {
       return false;
+    }
+  }
+
+  function checkAutoCloseHandledTab() {
+    if (!isAutoOpenedTab || !settings.autoCloseHandledTab || autoTabCloseSent) {
+      return;
+    }
+    // 如果用户主动切到这个标签页查看或正在输入框打字，暂不关闭，避免打断用户
+    const editor = getEditor();
+    const userTyping = editor && getEditorRawText(editor).length > 0;
+    const busy =
+      isGenerating() ||
+      hasPendingConfirmationCard() ||
+      queue.length > 0 ||
+      isScriptSubmitting ||
+      Boolean(pendingContinueTimer);
+
+    if (clickCount > 0 || isGenerating() || hasPendingConfirmationCard()) {
+      sawActivityInAutoTab = true;
+    }
+
+    if (busy || userTyping || !document.hidden) {
+      autoTabIdleSince = 0;
+      return;
+    }
+
+    const now = Date.now();
+    if (!autoTabIdleSince) {
+      autoTabIdleSince = now;
+      return;
+    }
+
+    const requiredIdle = sawActivityInAutoTab
+      ? AUTO_CLOSE_IDLE_MS
+      : AUTO_CLOSE_NO_ACTION_GRACE_MS;
+
+    if (now - autoTabIdleSince >= requiredIdle && now - tabLoadedAt >= 8000) {
+      autoTabCloseSent = true;
+      const convId = extractConversationIdFromPath(location.pathname);
+      console.info(
+        `[Gemini Auto Allow] 自动打开的任务标签（${convId || location.pathname}）已完工并持续空闲，正在自动关闭`
+      );
+      if (tabChannel && convId) {
+        try {
+          tabChannel.postMessage({ type: 'auto-tab-done', tabId: TAB_ID, convId });
+        } catch (_) {}
+      }
+      try {
+        window.close();
+      } catch (_) {}
     }
   }
 
@@ -1401,13 +1484,9 @@
       return;
     }
 
-    const now = Date.now();
-    if (now - lastSidebarOpenAt < SIDEBAR_OPEN_GLOBAL_GAP_MS) {
-      return;
-    }
-
-    const openedMap = loadOpenedFlagsMap();
-
+    // 先统计当前侧边栏仍带小旗子的会话集合，并释放已消失小旗的状态锁
+    const currentFlagged = [];
+    const currentFlaggedIds = new Set();
     for (const item of items) {
       const reason = detectSidebarFlagReason(item);
       if (!reason) {
@@ -1417,18 +1496,42 @@
       if (!info) {
         continue;
       }
+      currentFlaggedIds.add(info.convId);
+      currentFlagged.push({ info, reason });
+    }
+    for (const latchedId of [...latchedFlaggedConvIds]) {
+      if (!currentFlaggedIds.has(latchedId)) {
+        latchedFlaggedConvIds.delete(latchedId);
+      }
+    }
+
+    const now = Date.now();
+    if (now - lastSidebarOpenAt < SIDEBAR_OPEN_GLOBAL_GAP_MS) {
+      return;
+    }
+
+    const openedMap = loadOpenedFlagsMap();
+
+    for (const { info, reason } of currentFlagged) {
+      // 如果这个会话的小旗子自上次处理后从未消失（侧边栏缓存未刷新），跳过避免反复重开
+      if (latchedFlaggedConvIds.has(info.convId)) {
+        continue;
+      }
       if (isConversationOpenInAnyTab(info.convId)) {
+        latchedFlaggedConvIds.add(info.convId);
         continue;
       }
       const lastOpened = openedMap[info.convId] || 0;
       if (now - lastOpened < SIDEBAR_OPEN_COOLDOWN_MS) {
+        latchedFlaggedConvIds.add(info.convId);
         continue;
       }
 
       // 抢占锁并后台打开
+      latchedFlaggedConvIds.add(info.convId);
       markFlagOpened(info.convId);
       lastSidebarOpenAt = now;
-      if (openUrlInBackground(info.url)) {
+      if (openUrlInBackground(info.url, info.convId)) {
         autoOpenedCount += 1;
         console.info(
           `[Gemini Auto Allow] 监测到侧边栏待审批任务「${info.title}」(${reason})，已后台自动打开处理：${info.url}`
@@ -2332,6 +2435,10 @@
         key: 'sidebarFlagWatch',
       },
       {
+        label: '自动打开的标签完工后自动关闭',
+        key: 'autoCloseHandledTab',
+      },
+      {
         label: '紧凑窄窗主题（防侧边栏收缩）',
         key: 'compactNarrowTheme',
       },
@@ -2488,6 +2595,7 @@
     checkSidebarApprovalFlags();
     checkQueueDispatch();
     checkAutoContinue();
+    checkAutoCloseHandledTab();
     renderQueueDock();
     updateBadge();
     updateTabTitle();

@@ -5,24 +5,26 @@
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v3.2.2-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v3.2.2"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85_Userscript-v3.3.0-2B5B84?style=for-the-badge&amp;logo=tampermonkey&amp;logoColor=white" alt="一键安装 Userscript v3.3.0"></a>
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v3.2.2-3776AB?style=flat-square" alt="Version v3.2.2"></a>
+  <a href="https://raw.githubusercontent.com/myh333777/gemini-auto-allow-userscript/main/gemini-mcp-auto-allow.user.js"><img src="https://img.shields.io/badge/Version-v3.3.0-3776AB?style=flat-square" alt="Version v3.3.0"></a>
   <img src="https://img.shields.io/badge/Target-gemini.google.com-4B5563?style=flat-square" alt="Target gemini.google.com">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E?style=flat-square" alt="License: MIT"></a>
 </p>
 
-## 核心功能（v3.2.2）
+## 核心功能（v3.3.0）
 
 1. **全覆盖自动审批**
    - 同时监听 `remy-confirmation-card`、`remy-confirmation-card-v2`、`spark-waiting-for-user-banner` 以及 `[role="dialog"]` / `[role="alertdialog"]`（内置删除对话/清空记录类危险弹窗黑名单防误点）。
    - 放宽按钮前缀匹配，兼容带工具名/角标的按钮（如「始终允许 @mac3」「Always allow for ...」「允许一次 (shell)」），并优先排除「不允许 / Don't allow」。
    - 自动补发滞留在输入框里的审批文本，防止后台失焦态下点击后卡住不提交。
-2. **远程任务侧边栏「小旗子」自动监测 & 紧凑窄窗防收缩主题**
-   - 持续监测左侧对话栏中带小旗子 / 待审批标志的会话，使用 `@grant GM_openInTab` 在后台静默打开该会话标签页（不抢焦点），新标签页会自动完成审批并继续运行；内置当前页去重 + 跨标签去重 + 90 秒冷却锁。
-   - **紧凑窄窗主题（默认开启，可一键关闭）**：在 `≥ 640px` 的分屏/窄窗口下，将侧边栏从 `320px` 收紧至 `216px`、隐藏遮罩并改为左右并排（左 `216px` 侧边栏 + 右侧聊天区全宽、收紧左右留白与列表行高），点击聊天区不再把侧边栏收回去，彻底解决窄窗收缩导致监测不到小旗子的问题；手动点击收起侧边栏时右侧会自动回弹至全宽。
+2. **远程任务侧边栏「小旗子」全自动闭环 & 紧凑窄窗主题**
+   - 直接盯住 `<remy-goal-status-badge>` 中的 `needs-input` / `flag` 图标，后台静默通过 `GM_openInTab` 打开处理（自动排除转圈 `in-progress` 和未读圆点 `unread`）。
+   - **完工自动关闭临时标签**：由监控自动打开的标签页（`#gaa_auto=1`）在任务彻底跑完、无新审批且在后台持续空闲 15 秒后，通过子标签 `window.close()` + 父标签 `GM_openInTab` 句柄双保险自动关闭，不再堆积一堆旧标签。
+   - **状态跳变锁防缓存残留**：即使主监控页侧边栏短暂缓存未刷新导致旧小旗子没立刻消失，脚本会锁住该会话直到小旗子真正消失后再重新出现时才再次触发，绝不反复重开，也不影响监控其他会话。
+   - **紧凑窄窗主题 & 可自由拖动浮窗**：在 `≥ 640px` 窄窗下保持 216px 紧凑侧边栏并排不收缩；状态浮窗与排队栏均支持自由拖动并记忆位置（含一键复位）。
 3. **输入消息排队（Prompt Queue）**
    - Gemini 回复生成中、等待审批或已有排队项时，在输入框直接打字按 **Enter**（或点击发送），内容会立刻收进**输入框正上方的排队浮层**，不再被吞掉或干等；空闲时按 `Alt + Enter` 也可强制先入队。
    - **合并 / 逐条自由混排**：
